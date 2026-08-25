@@ -34,3 +34,9 @@ Thumbs.db
 
 # LeadGenUI
 LeadGenUI/
+
+# Live collector state and generated exports are local/large and are transferred
+# separately from source control. The SQLite database can exceed GitHub file limits.
+data/
+outputs/
+.artifact-build/

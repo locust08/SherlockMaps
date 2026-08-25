@@ -33,8 +33,11 @@ class CompanyData:
     plus_code: str = "N/A"
     opening_hours: str = "N/A"
     attributes: List[str] = field(default_factory=lambda: ["N/A"])
+    source_url: str = "N/A"
+    place_id: str = "N/A"
+    is_closed: bool = False
 
-    def to_dict(self) -> dict[str, str | List[str]]:
+    def to_dict(self) -> dict[str, str | bool | List[str]]:
         """Convert the company data to a dictionary.
 
         Returns:
@@ -51,6 +54,9 @@ class CompanyData:
             "plus_code": self.plus_code,
             "opening_hours": self.opening_hours,
             "attributes": self.attributes,
+            "source_url": self.source_url,
+            "place_id": self.place_id,
+            "is_closed": self.is_closed,
         }
 
     def has_valid_website(self) -> bool:

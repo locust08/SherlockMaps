@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from urllib.parse import quote_plus
 from typing import TYPE_CHECKING
 
 # Add the parent directory to sys.path so that `from core.*` imports work
@@ -61,6 +62,7 @@ class BrowserManager:
         """
         self._config = config
         self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._is_initialized = False
@@ -101,29 +103,10 @@ class BrowserManager:
         try:
             logger.info("Initializing Playwright browser...")
             self._playwright = sync_playwright().start()
-            browser_args = self._config.to_browser_args()
-            
-            # Use a unique profile directory per run to avoid ProcessSingleton conflicts
-            # This is critical when running multiple crawl jobs in the same container
-            import tempfile
-            import atexit
-            
-            # Create a unique temp directory for this browser instance
-            # but keep the base chrome_profile_path for cookies/storage persistence
-            base_profile = self._config.chrome_profile_path
-            if not os.path.exists(base_profile):
-                os.makedirs(base_profile, exist_ok=True)
-            
-            # Use the base profile path directly - the ProcessSingleton issue
-            # is solved by adding --profile-directory=Default and disabling process singleton
-            browser_args["args"].extend([
-                "--profile-directory=Default",
-                "--disable-process-singleton-check",
-                "--create-browser-if-missing=false",
-            ])
-            
-            self._context = self._playwright.chromium.launch_persistent_context(**browser_args)
-            self._page = self._context.new_page()
+            self._browser = self._playwright.chromium.launch(
+                **self._config.to_browser_args()
+            )
+            self._create_context_and_page()
             self._is_initialized = True
             logger.info("Browser launched successfully")
 
@@ -133,6 +116,93 @@ class BrowserManager:
                 message="Failed to initialize the browser.",
                 cause=e,
             ) from e
+
+    def _create_context_and_page(self, storage_state: dict | None = None) -> Page:
+        """Create the lightweight context used by a crawler worker."""
+        if not self._browser:
+            raise BrowserInitializationError("Browser is not available.")
+        context_args = self._config.to_context_args()
+        if storage_state:
+            context_args["storage_state"] = storage_state
+        self._context = self._browser.new_context(**context_args)
+        self._context.route("**/*", self._route_lightweight_resource)
+        self._page = self._context.new_page()
+        return self._page
+
+    def recycle_context(self) -> Page:
+        """Replace the complete browser context while keeping the browser slot alive.
+
+        Closing the context releases renderer, service-worker, and HTTP caches much
+        more reliably than refreshing or replacing a page alone. Cookies and local
+        storage are retained to avoid repeatedly showing consent screens.
+        """
+        if not self._browser:
+            raise BrowserInitializationError("Browser is not available.")
+
+        storage_state = None
+        if self._context:
+            try:
+                storage_state = self._context.storage_state()
+            except Exception:
+                pass
+        if self._page:
+            try:
+                self._page.close()
+            except Exception:
+                pass
+        if self._context:
+            try:
+                self._context.close()
+            except Exception:
+                pass
+        self._page = None
+        self._context = None
+        page = self._create_context_and_page(storage_state)
+        logger.info("Browser context recycled")
+        return page
+
+    def collect_garbage(self) -> None:
+        """Ask Chromium to reclaim JavaScript heap without disrupting navigation."""
+        if not self._page or self._page.is_closed():
+            return
+        request_gc = getattr(self._page, "request_gc", None)
+        if callable(request_gc):
+            try:
+                request_gc()
+                return
+            except Exception:
+                pass
+        if not self._context:
+            return
+        session = None
+        try:
+            session = self._context.new_cdp_session(self._page)
+            session.send("HeapProfiler.collectGarbage")
+        except Exception:
+            logger.debug("Chromium garbage collection request was unavailable")
+        finally:
+            if session:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _route_lightweight_resource(route) -> None:
+        """Discard visual and tracking resources that extraction never reads."""
+        request = route.request
+        url = request.url.lower()
+        blocked_types = {"image", "media", "font"}
+        blocked_hosts = (
+            "google-analytics.com",
+            "googletagmanager.com",
+            "doubleclick.net",
+            "googleadservices.com",
+        )
+        if request.resource_type in blocked_types or any(host in url for host in blocked_hosts):
+            route.abort()
+        else:
+            route.continue_()
 
     def navigate_to_maps(self, prompt: str) -> Page:
         """Navigate to Google Maps search results for the given prompt.
@@ -198,8 +268,9 @@ class BrowserManager:
         Returns:
             A URL-friendly search string.
         """
-        formatted = prompt.replace(" ", "+")
-        return f"https://www.google.com/maps/search/{formatted}?hl=de"
+        formatted = quote_plus(prompt)
+        language = (self._config.locale or "en-MY").split("-")[0]
+        return f"https://www.google.com/maps/search/{formatted}?hl={language}"
 
     def _handle_consent_banner(self) -> None:
         """Attempt to accept the Google consent banner if present."""
@@ -208,6 +279,8 @@ class BrowserManager:
 
         try:
             consent_button = self._page.locator(
+                'button[aria-label*="Accept all"], button:has-text("Accept all"), '
+                'button[aria-label*="Terima semua"], button:has-text("Terima semua"), '
                 'button[aria-label*="Alle akzeptieren"], button:has-text("Alle akzeptieren")'
             )
             if consent_button.count() > 0:
@@ -236,6 +309,14 @@ class BrowserManager:
             except Exception:
                 pass
             self._context = None
+
+        if self._browser:
+            try:
+                self._browser.close()
+                logger.info("Browser closed")
+            except Exception:
+                pass
+            self._browser = None
 
         self._is_initialized = False
         self._cleanup_playwright()

@@ -34,3 +34,10 @@ class ExtractionError(CrawlerBaseException):
 
     def __init__(self, message: str = "Failed to extract data from the page.", cause: Exception | None = None):
         super().__init__(message=message, cause=cause)
+
+
+class MemoryPressureError(CrawlerBaseException):
+    """Raised when a crawl must yield memory and be resumed later."""
+
+    def __init__(self, message: str = "MEMORY_PRESSURE: crawl reclaimed to protect Windows RAM"):
+        super().__init__(message=message)

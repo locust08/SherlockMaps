@@ -152,7 +152,15 @@ class GoogleMapsCrawler:
             page = self._browser_manager.navigate_to_maps(search_prompt)
 
             # Step 2: Extract company data
-            extractor = MapsExtractor(page, self._config.selector_timeout)
+            extractor = MapsExtractor(
+                page,
+                self._config.selector_timeout,
+                max_results=self._config.initial_results,
+                scroll_timeout=self._config.scroll_timeout,
+                max_scroll_attempts=self._config.max_scroll_attempts,
+                adaptive_results=self._config.adaptive_results,
+                hard_result_cap=self._config.hard_result_cap,
+            )
             raw_results = extractor.extract_all()
 
             if not raw_results:
@@ -166,20 +174,17 @@ class GoogleMapsCrawler:
             deduplicator = DeduplicationProcessor()
             unique_results = deduplicator.process(raw_results)
 
-            # Step 4: Filter valid websites
-            valid_results = [c for c in unique_results if URLValidator.is_valid(c.website)]
-
-            self._results = valid_results
+            self._results = unique_results
             logger.info(
-                "Crawl complete. Found %d companies with valid websites",
-                len(valid_results),
+                "Crawl complete. Found %d unique companies",
+                len(unique_results),
             )
 
             # Step 5: Output results
             output_handler = OutputHandler()
-            output_handler.output(valid_results, search_prompt, self._config.output_format)
+            output_handler.output(unique_results, search_prompt, self._config.output_format)
 
-            return valid_results
+            return unique_results
 
         except CrawlerBaseException as e:
             logger.error("Crawler error: %s", e)

@@ -16,8 +16,8 @@ class ViewPort:
         height: The viewport height in pixels.
     """
 
-    width: int = 1920
-    height: int = 1080
+    width: int = 1024
+    height: int = 768
 
     def to_dict(self) -> dict[str, int]:
         """Convert to dictionary for Playwright.
@@ -60,6 +60,9 @@ class CrawlerConfig:
     selector_timeout: int = 15000
     scroll_timeout: int = 45
     max_scroll_attempts: int = 5
+    initial_results: int = 100
+    adaptive_results: int = 200
+    hard_result_cap: int = 500
     max_retries: int = 3
     request_timeout: int = 25000
 
@@ -90,20 +93,32 @@ class CrawlerConfig:
         return new_config
 
     def to_browser_args(self) -> dict:
-        """Convert config to Playwright launch_persistent_context arguments.
+        """Convert config to lightweight Playwright browser launch arguments.
 
         Returns:
             A dictionary of browser launch arguments.
         """
         return {
-            "user_data_dir": self.chrome_profile_path,
             "headless": self.headless,
             "args": [
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--no-first-run",
             ],
+        }
+
+    def to_context_args(self) -> dict:
+        """Convert config to isolated, non-persistent browser context arguments."""
+        return {
             "locale": self.locale,
             "viewport": self.viewport.to_dict(),
         }

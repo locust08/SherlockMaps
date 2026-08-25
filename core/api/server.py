@@ -106,7 +106,16 @@ def run_crawl_in_process(
     output_format: str = "json",
     headless: bool = False,
     locale: str = "de-DE",
-) -> list[dict[str, Any]]:
+    max_results: int | None = None,
+    scroll_timeout: int = 45,
+    max_scroll_attempts: int = 5,
+    adaptive_results: int | None = None,
+    hard_result_cap: int = 500,
+    include_metrics: bool = False,
+    result_callback: Any = None,
+    memory_guard: Any = None,
+    page_recycle_interval: int = 10,
+) -> Any:
     """Run a crawl in a worker process.
 
     This function performs the actual crawl operation using synchronous Playwright code
@@ -121,19 +130,17 @@ def run_crawl_in_process(
     Returns:
         List of company dictionaries.
     """
-    import tempfile
-    
-    # Create a unique temporary profile directory for this crawl
-    # This avoids ProcessSingleton conflicts when running multiple crawls
-    temp_profile_dir = tempfile.mkdtemp(prefix="chrome_profile_")
-    
-    # Import and initialize browser in this process with unique profile
+    # Every crawl receives an isolated, non-persistent browser context.
     config = CrawlerConfig(
         search_prompt=prompt,
         headless=headless,
         output_format=output_format,
         locale=locale,
-        chrome_profile_path=temp_profile_dir,
+        scroll_timeout=scroll_timeout,
+        max_scroll_attempts=max_scroll_attempts,
+        initial_results=max_results or 100,
+        adaptive_results=adaptive_results or max_results or 100,
+        hard_result_cap=hard_result_cap,
     )
 
     browser_mgr = BrowserManager(config)
@@ -144,11 +151,34 @@ def run_crawl_in_process(
         page = browser_mgr.navigate_to_maps(prompt)
 
         # Extract data
-        extractor = MapsExtractor(page, config.selector_timeout)
+        extractor = MapsExtractor(
+            page,
+            config.selector_timeout,
+            max_results=max_results,
+            scroll_timeout=config.scroll_timeout,
+            max_scroll_attempts=config.max_scroll_attempts,
+            adaptive_results=config.adaptive_results,
+            hard_result_cap=config.hard_result_cap,
+            result_callback=result_callback,
+            memory_guard=memory_guard,
+            page_recycle_interval=page_recycle_interval,
+            page_recycler=browser_mgr.recycle_context,
+            memory_cleanup_callback=browser_mgr.collect_garbage,
+            discovery_cleanup_interval=30,
+        )
         raw_results = extractor.extract_all()
 
         if not raw_results:
             logger.warning("No companies found for prompt: %s", prompt)
+            if include_metrics:
+                return {
+                    "results": [],
+                    "links_discovered": extractor.links_discovered,
+                    "processed_count": 0,
+                    "end_of_results": extractor.end_of_results,
+                    "page_recycle_count": extractor.page_recycle_count,
+                    "memory_cleanup_count": extractor.memory_cleanup_count,
+                }
             return []
 
         logger.info("Extracted %d raw companies", len(raw_results))
@@ -157,25 +187,21 @@ def run_crawl_in_process(
         deduplicator = DeduplicationProcessor()
         unique_results = deduplicator.process(raw_results)
 
-        # Filter valid websites
-        valid_results = [c for c in unique_results if URLValidator.is_valid(c.website)]
-
-        logger.info(
-            "Crawl complete. Found %d companies with valid websites",
-            len(valid_results),
-        )
-
-        # Convert to list of dicts
-        return [company.to_dict() for company in valid_results]
+        result_dicts = [company.to_dict() for company in unique_results]
+        logger.info("Crawl complete. Found %d unique companies", len(result_dicts))
+        if include_metrics:
+            return {
+                "results": result_dicts,
+                "links_discovered": extractor.links_discovered,
+                "processed_count": len(raw_results),
+                "end_of_results": extractor.end_of_results,
+                "page_recycle_count": extractor.page_recycle_count,
+                "memory_cleanup_count": extractor.memory_cleanup_count,
+            }
+        return result_dicts
 
     finally:
         browser_mgr.close()
-        # Clean up temporary profile directory
-        import shutil
-        try:
-            shutil.rmtree(temp_profile_dir, ignore_errors=True)
-        except Exception:
-            pass
 
 
 def _create_app() -> FastAPI:
@@ -503,6 +529,7 @@ async def _process_job(job_id: str) -> None:
             job.output_format,
             job.headless,
             job.locale,
+            job.max_results,
         )
 
         await queue_manager.complete_job(job_id, results)

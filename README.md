@@ -6,6 +6,8 @@
 
 A professional, open-source Google Maps web crawler that extracts company information from Google Maps. Built with [Playwright](https://playwright.dev/) for browser automation.
 
+For the Malaysia adaptive collector, dashboard, exports, database transfer, and Windows auto-resume setup, see [PORTABLE_SETUP.md](PORTABLE_SETUP.md).
+
 <div align="center">
   <h2>Sherlock Maps</h2>
   <p>Open-Source Google Maps Webcrawler</p>
