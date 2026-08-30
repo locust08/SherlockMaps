@@ -147,6 +147,9 @@ class GoogleMapsCrawler:
             logger.error("Browser manager not initialized")
             return []
 
+        # Get track_reviews from config
+        track_reviews = getattr(self._config, 'track_reviews', True)
+
         try:
             # Step 1: Navigate to Google Maps
             page = self._browser_manager.navigate_to_maps(search_prompt)
@@ -161,7 +164,7 @@ class GoogleMapsCrawler:
                 adaptive_results=self._config.adaptive_results,
                 hard_result_cap=self._config.hard_result_cap,
             )
-            raw_results = extractor.extract_all()
+            raw_results = extractor.extract_all(track_reviews=track_reviews)
 
             if not raw_results:
                 logger.warning("No companies found for prompt: %s", search_prompt)
@@ -226,6 +229,7 @@ def run_crawler(
     prompt: str,
     headless: bool = False,
     output_format: str = "json",
+    track_reviews: bool = True,
 ) -> list[CompanyData]:
     """Convenience function to run a crawl with default settings.
 
@@ -233,6 +237,7 @@ def run_crawler(
         prompt: The search term (e.g., "restaurants berlin").
         headless: Whether to run the browser in headless mode.
         output_format: The output format.
+        track_reviews: Whether to extract reviews for each company.
 
     Returns:
         A list of CompanyData objects.
@@ -241,6 +246,7 @@ def run_crawler(
         search_prompt=prompt,
         headless=headless,
         output_format=output_format,
+        track_reviews=track_reviews,
     )
 
     with GoogleMapsCrawler(config) as crawler:

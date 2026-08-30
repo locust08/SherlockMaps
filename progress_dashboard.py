@@ -34,6 +34,24 @@ def table(headers: list[str], rows: list[tuple]) -> str:
     return f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
+NAV_ITEMS = (
+    ("dashboard", "/", "Dashboard"),
+    ("leads", "/leads", "Ranked Leads"),
+    ("pipeline", "/pipeline", "Sales Pipeline"),
+    ("coverage", "/coverage", "Coverage & Yield"),
+    ("searches", "/searches", "Search Queries"),
+    ("report", "/export/report.html", "Summary Report"),
+)
+
+
+def navigation(active: str = "") -> str:
+    links = "".join(
+        f"<a href='{url}' class='{'active' if key == active else ''}'>{esc(label)}</a>"
+        for key, url, label in NAV_ITEMS
+    )
+    return f"<nav class='topnav' aria-label='Dashboard pages'>{links}</nav>"
+
+
 def connection() -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
     conn.execute("PRAGMA busy_timeout=20000")
@@ -197,8 +215,8 @@ def report_page(data: dict) -> str:
     ]
     summary_rows = [(label, value) for label, value in sections]
     return f"""<!doctype html><html><head><meta charset='utf-8'><title>SherlockMaps Malaysia Report</title>
-    <style>body{{font-family:Segoe UI,Arial,sans-serif;margin:36px;color:#142535}}h1{{color:#102f46}}table{{border-collapse:collapse;min-width:520px}}td,th{{border:1px solid #cbd8df;padding:9px;text-align:left}}th{{background:#1f6f8b;color:#fff}}h2{{margin-top:30px}}small{{color:#607585}}</style></head><body>
-    <h1>SherlockMaps Malaysia Collection Report</h1><small>Generated {esc(generated)} · source database: malaysia_qualified_companies.sqlite</small>
+    <style>body{{font-family:Segoe UI,Arial,sans-serif;margin:36px;color:#142535}}h1{{color:#102f46}}table{{border-collapse:collapse;min-width:520px}}td,th{{border:1px solid #cbd8df;padding:9px;text-align:left}}th{{background:#1f6f8b;color:#fff}}h2{{margin-top:30px}}small{{color:#607585}}.topnav{{display:flex;flex-wrap:wrap;gap:7px;margin:0 0 24px}}.topnav a{{padding:9px 12px;border-radius:7px;background:#e8f0f4;color:#15566d;text-decoration:none}}.topnav a.active{{background:#1f6f8b;color:white}}</style></head><body>
+    {navigation('report')}<h1>LOCUS-T Malaysia Collection Report</h1><small>Generated {esc(generated)} · source database: malaysia_qualified_companies.sqlite</small>
     <h2>Collection summary</h2>{table(['Metric','Value'], summary_rows)}
     <h2>By industry</h2>{table(['Industry','Locations'], data['sectors'])}
     <h2>By lead tier</h2>{table(['Lead tier','Locations'], data['tiers'])}
@@ -296,6 +314,7 @@ CSS = """
 body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f3f6f8;color:#142535}
 header{background:#102f46;color:white;padding:26px 5vw}h1{margin:0;font-size:28px}
 header p{margin:7px 0 0;color:#c9e3f0}a{color:#167398}header a{color:#d5edf7}
+.topnav{display:flex;flex-wrap:wrap;gap:7px;margin:16px 0 8px}.topnav a{padding:9px 12px;border:1px solid #46758c;border-radius:7px;background:#163f56;color:#dceef6;text-decoration:none;font-size:14px}.topnav a:hover{background:#245d76}.topnav a.active{background:#e7f4f8;color:#123047;border-color:#e7f4f8;font-weight:700}
 .status-strip{display:flex;flex-wrap:wrap;gap:10px 20px;margin-top:13px;padding:10px 12px;background:#0b2639;border-radius:8px;font-size:13px;color:#d7ebf4}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.dot.good{background:#37c978}.dot.warn{background:#f4a340}.dot.bad{background:#ef5b5b}
 main{max-width:1600px;margin:24px auto;padding:0 22px}.cards{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:14px}
@@ -331,7 +350,7 @@ def dashboard_page(data: dict) -> str:
     ram_class = "good" if ram_state == "healthy" else "bad" if ram_state == "critical" else "warn"
     return f"""<!doctype html><html><head><meta charset='utf-8'>
     <title>LOCUS-T Lead Intelligence V4</title><style>{CSS}</style></head><body>
-    <header><h1>LOCUS-T Lead Intelligence V4</h1><p>400,000 sales-ready Malaysian locations · focus: Klang Valley 55%, Johor 25%, Penang 20% · <a href='/searches'>Searches</a> · <a href='/leads'>Ranked leads</a> · <a href='/pipeline'>Sales pipeline</a> · <a href='/coverage'>Coverage</a></p>
+    <header><h1>LOCUS-T Lead Intelligence V4</h1>{navigation('dashboard')}<p>400,000 sales-ready Malaysian locations · focus: Klang Valley 55%, Johor 25%, Penang 20%</p>
     <div class='status-strip'>
       <span>Dashboard refreshed: <strong id='dashboard-refresh'>--</strong></span>
       <span><i id='heartbeat-dot' class='dot {state_class}'></i>Collector updated: <strong id='collector-update'>--</strong> (<span id='heartbeat-age'>--</span>)</span>
@@ -453,17 +472,16 @@ def searches_page(query: str = "", page_number: int = 1) -> str:
     next_link = f"<a href='/searches?q={encoded_query}&page={page_number+1}'>Next →</a>" if page_number < pages else ""
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='60'>
     <title>All Searches — LOCUS-T V4</title><style>{CSS}</style></head><body>
-    <header><h1>All Search Queries</h1><p><a href='/'>← Dashboard</a> · {total:,} matching queries · page {page_number:,} of {pages:,}</p></header>
+    <header><h1>All Search Queries</h1>{navigation('searches')}<p>{total:,} matching queries · page {page_number:,} of {pages:,}</p></header>
     <main><form method='get'><input name='q' value='{encoded_query}' placeholder='Filter by prompt, industry, or status'></form>
     <p>{previous_link} &nbsp; {next_link}</p>
     {table(['Taxonomy','Source','Prompt','Industry','Area','State','Term','Geo level','Status','Attempts','Links','Processed','New','Duplicates','Rejected','Started','Completed','Error'],rows)}
     </main></body></html>"""
 
 
-def page(title: str, body: str) -> str:
+def page(title: str, body: str, active: str = "") -> str:
     return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title>
-    <style>{CSS}</style></head><body><header><h1>{esc(title)}</h1>
-    <p><a href='/'>Dashboard</a> · <a href='/leads'>Ranked leads</a> · <a href='/pipeline'>Sales pipeline</a> · <a href='/coverage'>Coverage</a> · <a href='/searches'>Searches</a></p>
+    <style>{CSS}</style></head><body><header><h1>{esc(title)}</h1>{navigation(active)}
     </header><main>{body}</main></body></html>"""
 
 
@@ -533,7 +551,7 @@ def ranked_leads_page(params: dict[str, list[str]]) -> str:
       <p>{total:,} matching locations · page {page_number:,}/{pages:,} · {previous} &nbsp; {next_link}</p>
       <div class='actions'><a class='button' href='/export/call-list.csv'>Download brand-deduplicated A/B call list</a></div>
       {table(['Org ID','Business','Industry','Offer','Score','Rank','Status','PIC','Phone','Email','Website','Locality','State','Rating','Reviews'], rows)}"""
-    return page("Ranked LOCUS-T leads", body)
+    return page("Ranked LOCUS-T leads", body, "leads")
 
 
 CALL_LIST_COLUMNS = [
@@ -650,7 +668,7 @@ def pipeline_page(message: str = "") -> str:
       <script>document.getElementById('import-form').addEventListener('submit',async event=>{{event.preventDefault();const file=document.getElementById('csv-file').files[0];
       const response=await fetch('/import/sales-updates',{{method:'POST',headers:{{'Content-Type':'text/csv; charset=utf-8'}},body:await file.text()}});
       document.open();document.write(await response.text());document.close();}});</script>"""
-    return page("Sales pipeline and PIC handoff", body)
+    return page("Sales pipeline and PIC handoff", body, "pipeline")
 
 
 def coverage_page() -> str:
@@ -682,7 +700,7 @@ def coverage_page() -> str:
       <h2>Query allocation and results</h2>{table(['Market','Queries','Completed','Qualified','A/B leads','Expected A/B'],market)}
       <h2>A/B yield by industry and strategy</h2>{table(['Industry','Strategy','Queries','Completed','Qualified','A/B leads','Expected A/B','Duplicate %'],yield_rows)}
       <h2>Lead coverage in primary markets</h2>{table(['State','Industry','Locations','A/B leads'],coverage)}"""
-    return page("Coverage and query yield", body)
+    return page("Coverage and query yield", body, "coverage")
 
 
 def import_sales_updates(raw: bytes) -> tuple[int, list[str]]:
@@ -770,7 +788,7 @@ class Handler(BaseHTTPRequestHandler):
                 message += f" {len(errors):,} rows failed: " + "; ".join(errors[:10])
             self.respond(pipeline_page(message), "text/html; charset=utf-8")
         except Exception as exc:
-            self.respond(page("Sales import failed", f"<p class='bad'>{esc(exc)}</p><p><a href='/pipeline'>Return to pipeline</a></p>"), "text/html; charset=utf-8")
+            self.respond(page("Sales import failed", f"<p class='bad'>{esc(exc)}</p><p><a href='/pipeline'>Return to pipeline</a></p>", "pipeline"), "text/html; charset=utf-8")
 
     def respond(self, body: str, content_type: str) -> None:
         content = body.encode("utf-8")

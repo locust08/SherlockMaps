@@ -890,7 +890,7 @@ def crawl_task(task: QueryTask, db_path: str) -> CrawlOutcome:
             max_results=task.initial_results, scroll_timeout=task.scroll_timeout,
             max_scroll_attempts=MAX_SCROLL_ATTEMPTS, adaptive_results=task.adaptive_results,
             hard_result_cap=task.hard_result_cap, include_metrics=True, result_callback=callback,
-            memory_guard=memory_guard, page_recycle_interval=10,
+            memory_guard=memory_guard, page_recycle_interval=10, track_reviews=False,
         )
         return CrawlOutcome(task, int(payload["links_discovered"]), counters["processed"],
                             counters["accepted"], counters["new"], counters["duplicate"], counters["rejected"],

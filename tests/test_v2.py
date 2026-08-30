@@ -25,7 +25,7 @@ from core.exceptions import MemoryPressureError
 from core.extractors.maps_extractor import MapsExtractor
 from core.models import CrawlerConfig
 from lead_intelligence_v4 import backfill_v4, bulk_score_missing, organization_key, update_sales_lead
-from progress_dashboard import call_list_query, dashboard_page
+from progress_dashboard import NAV_ITEMS, call_list_query, dashboard_page, navigation
 
 
 class V3CollectorTests(unittest.TestCase):
@@ -179,7 +179,7 @@ class V3CollectorTests(unittest.TestCase):
                     FakePage(context), max_results=result_count, page_recycle_interval=10
                 )
                 extractor.processing_limit = result_count
-                extractor._extract_company_details = lambda _url, _index: None
+                extractor._extract_company_details = lambda _url, _index, track_reviews=True: None
                 with patch("core.extractors.maps_extractor.time.sleep"):
                     extractor._process_links([f"url-{index}" for index in range(result_count)])
                 self.assertEqual(extractor.page_recycle_count, expected_recycles)
@@ -189,7 +189,7 @@ class V3CollectorTests(unittest.TestCase):
             FakePage(context), max_results=1, page_recycler=lambda: recycled_pages.append(1) or FakePage(context)
         )
         extractor.processing_limit = 1
-        extractor._extract_company_details = lambda _url, _index: None
+        extractor._extract_company_details = lambda _url, _index, track_reviews=True: None
         with patch("core.extractors.maps_extractor.time.sleep"):
             extractor._process_links(["url"])
         self.assertEqual(len(recycled_pages), 1)
@@ -214,6 +214,15 @@ class V3CollectorTests(unittest.TestCase):
             "sectors": [], "recent": [], "jobs": [], "events": [],
         })
         self.assertIn("2 active / 3 allowed / 4 max", html)
+
+    def test_dashboard_navigation_lists_every_page_and_marks_active_page(self) -> None:
+        html = navigation("pipeline")
+        for key, url, label in NAV_ITEMS:
+            self.assertIn(f"href='{url}'", html)
+            self.assertIn(label.replace("&", "&amp;"), html)
+            expected_class = "active" if key == "pipeline" else ""
+            self.assertIn(f"href='{url}' class='{expected_class}'", html)
+        self.assertIn("aria-label='Dashboard pages'", html)
 
     def test_v4_scoring_organization_and_suppression(self) -> None:
         reason = persist_observation(self.conn, self.task, {
