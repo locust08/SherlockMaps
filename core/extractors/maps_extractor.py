@@ -366,6 +366,7 @@ class MapsExtractor:
             details = {
                 "name": self._safe_text(self._page.locator(self.NAME_SELECTOR)),
                 "rating": self._extract_rating(),
+                "reviews_count": self._extract_reviews_count(),
                 "category": self._extract_category(),
                 "address": self._safe_text(
                     self._page.locator(self.ADDRESS_CONTAINER_SELECTOR)
@@ -421,6 +422,27 @@ class MapsExtractor:
 
         rating_match = re.search(r"([\d,\.]+)", rating_text)
         return rating_match.group(1).replace(",", ".") if rating_match else "N/A"
+
+    def _extract_reviews_count(self) -> str:
+        """Extract review volume from the review button or rating summary."""
+        selectors = (
+            'button[jsaction*="reviewChart"]',
+            'button[jsaction*="moreReviews"]',
+            self.RATING_SELECTOR,
+        )
+        for selector in selectors:
+            locator = self._page.locator(selector)
+            if locator.count() < 1:
+                continue
+            text = self._safe_attribute(locator.first, "aria-label", default="")
+            text = text or self._safe_text(locator.first, default="")
+            match = re.search(r"([\d][\d,\.\s]*)\s+(?:reviews?|ulasan)", text, re.I)
+            if match:
+                return re.sub(r"\D", "", match.group(1)) or "0"
+            values = re.findall(r"\d[\d,\.]*", text)
+            if len(values) >= 2:
+                return re.sub(r"\D", "", values[-1]) or "0"
+        return "N/A"
 
     def _extract_category(self) -> str:
         """Extract the company category.

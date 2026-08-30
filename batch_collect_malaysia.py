@@ -1,4 +1,4 @@
-"""Compatibility launcher for the adaptive Malaysia V2 collector."""
+"""Stable launcher for the append-only LOCUS-T V4 Malaysia collector."""
 
 from batch_collect_malaysia_v2 import make_parser, run_batch
 

@@ -1,4 +1,4 @@
-"""Read-only V3 dashboard for the Malaysia collector."""
+"""V4 collection and sales-operations dashboard for LOCUS-T Malaysia leads."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as xml_escape
+
+from lead_intelligence_v4 import INTELLIGENCE_VERSION, SALES_STATUSES, update_sales_lead
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "malaysia_qualified_companies.sqlite"
@@ -38,10 +40,24 @@ def connection() -> sqlite3.Connection:
     return conn
 
 
+def write_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
 COMPANY_EXPORT_COLUMNS = [
+    ("Company ID", "c.id"),
+    ("Organization ID", "co.organization_id"),
     ("Business name", "c.business_name"),
     ("Industry", "COALESCE(ic.industry_label,c.sector)"),
     ("Lead tier", "COALESCE(c.lead_tier,'LEGACY')"),
+    ("Primary offer", "li.primary_offer"),
+    ("Sales score", "li.sales_readiness_score"),
+    ("Sales rank", "li.sales_rank"),
+    ("Sales status", "sl.status"),
+    ("Assigned PIC", "sl.assigned_pic"),
     ("Address", "c.address"),
     ("Locality", "COALESCE(c.locality,c.city_state)"),
     ("State", "COALESCE(c.state_name,c.city_state)"),
@@ -49,6 +65,9 @@ COMPANY_EXPORT_COLUMNS = [
     ("Website", "c.website"),
     ("Maps category", "c.maps_category"),
     ("Rating", "c.rating"),
+    ("Review count", "c.reviews_count"),
+    ("Public email", "wi.public_email"),
+    ("WhatsApp", "wi.whatsapp_url"),
     ("Maps place ID", "c.maps_place_id"),
     ("Source URL", "c.source_url"),
     ("First seen", "c.first_seen_at"),
@@ -59,8 +78,14 @@ COMPANY_EXPORT_COLUMNS = [
 def company_export_query() -> str:
     fields = ",".join(expr for _, expr in COMPANY_EXPORT_COLUMNS)
     return f"""SELECT {fields}
-        FROM companies c LEFT JOIN company_industry_classification ic
-          ON ic.company_id=c.id AND ic.taxonomy_version=3
+        FROM companies c
+        LEFT JOIN company_industry_classification ic
+          ON ic.company_id=c.id AND ic.taxonomy_version=4
+        LEFT JOIN company_organization co ON co.company_id=c.id
+        LEFT JOIN lead_intelligence li
+          ON li.company_id=c.id AND li.intelligence_version=4
+        LEFT JOIN sales_leads sl ON sl.organization_id=co.organization_id
+        LEFT JOIN website_intelligence wi ON wi.company_id=c.id
         ORDER BY c.id"""
 
 
@@ -108,6 +133,14 @@ def xlsx_cell(value: object, ref: str) -> str:
     return f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(text)}</t></is></c>'
 
 
+def xlsx_column(index: int) -> str:
+    result = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
 def company_export_xlsx() -> bytes:
     # Build a standards-compliant XLSX using only the Python standard library.
     rows = io.StringIO()
@@ -115,13 +148,13 @@ def company_export_xlsx() -> bytes:
     headers = [label for label, _ in COMPANY_EXPORT_COLUMNS]
     rows.write('<row r="1">')
     for index, value in enumerate(headers, 1):
-        rows.write(xlsx_cell(value, f"{chr(64 + index)}1"))
+        rows.write(xlsx_cell(value, f"{xlsx_column(index)}1"))
     rows.write('</row>')
     conn = connection()
     for row_number, row in enumerate(conn.execute(company_export_query()), 2):
         rows.write(f'<row r="{row_number}">')
         for index, value in enumerate(row, 1):
-            rows.write(xlsx_cell(value, f"{chr(64 + index)}{row_number}"))
+            rows.write(xlsx_cell(value, f"{xlsx_column(index)}{row_number}"))
         rows.write('</row>')
     conn.close()
     rows.write('</sheetData></worksheet>')
@@ -198,7 +231,7 @@ def read_dashboard_data() -> dict:
     conn = connection()
     sectors = conn.execute(
         """SELECT industry_label,COUNT(*) FROM company_industry_classification
-           WHERE taxonomy_version=3 GROUP BY industry_label ORDER BY COUNT(*) DESC"""
+           WHERE taxonomy_version=4 GROUP BY industry_label ORDER BY COUNT(*) DESC"""
     ).fetchall()
     tiers = conn.execute("SELECT COALESCE(lead_tier,'LEGACY'),COUNT(*) FROM companies GROUP BY lead_tier ORDER BY COUNT(*) DESC").fetchall()
     states = conn.execute("SELECT COALESCE(state_name,city_state),COUNT(*) FROM companies GROUP BY 1 ORDER BY 2 DESC LIMIT 20").fetchall()
@@ -206,13 +239,13 @@ def read_dashboard_data() -> dict:
         """SELECT c.business_name,COALESCE(ic.industry_label,c.sector),COALESCE(c.locality,c.city_state),c.maps_category,
                   COALESCE(lead_tier,'LEGACY'),phone,website,rating
            FROM companies c LEFT JOIN company_industry_classification ic
-             ON ic.company_id=c.id AND ic.taxonomy_version=3
+             ON ic.company_id=c.id AND ic.taxonomy_version=4
            ORDER BY c.last_seen_at DESC LIMIT 30"""
     ).fetchall()
     jobs = conn.execute(
         """SELECT prompt,status,links_discovered,processed_count,qualified_new,
                   duplicate_count,rejected_count,worker_id,completed_at,error
-           FROM search_jobs WHERE taxonomy_version=3
+           FROM search_jobs WHERE taxonomy_version IN (3,4)
            ORDER BY COALESCE(completed_at,started_at) DESC LIMIT 30"""
     ).fetchall()
     events = conn.execute(
@@ -225,14 +258,38 @@ def read_dashboard_data() -> dict:
                  FROM jobs WHERE collector_version=2
                UNION ALL
                SELECT links_discovered,processed_count,duplicate_count,rejected_count
-                 FROM search_jobs WHERE taxonomy_version=3
+                 FROM search_jobs WHERE taxonomy_version IN (3,4)
            ) SELECT COALESCE(SUM(links_discovered),0),COALESCE(SUM(processed_count),0),
                     COALESCE(SUM(duplicate_count),0),COALESCE(SUM(rejected_count),0)
                FROM all_jobs"""
     ).fetchone()
+    ranks = conn.execute(
+        """SELECT sales_rank,COUNT(*) FROM lead_intelligence
+           WHERE intelligence_version=4 GROUP BY sales_rank ORDER BY sales_rank"""
+    ).fetchall()
+    offers = conn.execute(
+        """SELECT primary_offer,COUNT(*) FROM lead_intelligence
+           WHERE intelligence_version=4 GROUP BY primary_offer ORDER BY COUNT(*) DESC"""
+    ).fetchall()
+    pipeline = conn.execute(
+        """SELECT status,COUNT(*) FROM sales_leads GROUP BY status
+           ORDER BY CASE status WHEN 'NEW' THEN 0 WHEN 'REVIEWED' THEN 1 WHEN 'CONTACTED' THEN 2
+           WHEN 'QUALIFIED' THEN 3 WHEN 'DISCOVERY' THEN 4 WHEN 'PROPOSAL_SENT' THEN 5
+           WHEN 'WON' THEN 6 WHEN 'LOST' THEN 7 ELSE 8 END"""
+    ).fetchall()
+    markets = conn.execute(
+        """SELECT CASE WHEN c.state_name IN ('Selangor','Federal Territory') THEN 'Klang Valley'
+                    WHEN c.state_name='Johor' THEN 'Johor'
+                    WHEN c.state_name='Penang' THEN 'Penang' ELSE 'Other (legacy)' END market,
+                  COUNT(*),SUM(CASE WHEN li.sales_rank IN ('A','B') THEN 1 ELSE 0 END)
+           FROM companies c LEFT JOIN lead_intelligence li
+             ON li.company_id=c.id AND li.intelligence_version=4
+           GROUP BY market ORDER BY COUNT(*) DESC"""
+    ).fetchall()
     conn.close()
     return {"status": status, "sectors": sectors, "tiers": tiers, "states": states,
-            "recent": recent, "jobs": jobs, "events": events, "totals": totals}
+            "recent": recent, "jobs": jobs, "events": events, "totals": totals,
+            "ranks": ranks, "offers": offers, "pipeline": pipeline, "markets": markets}
 
 
 CSS = """
@@ -249,7 +306,7 @@ h2{font-size:19px;margin:30px 0 10px}.grid2{display:grid;grid-template-columns:1
 table{width:100%;border-collapse:collapse;background:white;font-size:12.5px}th{background:#1f6f8b;color:white;text-align:left;padding:9px;position:sticky;top:0}
 td{padding:8px;border-bottom:1px solid #e4ebef;vertical-align:top;max-width:380px;word-break:break-word}tr:nth-child(even){background:#f8fbfc}
 .table-wrap{overflow:auto;max-height:470px;border:1px solid #d8e2e8;border-radius:8px}
-input{padding:9px;width:min(480px,90%);border:1px solid #b9c8d1;border-radius:6px;margin-bottom:12px}
+input,select,textarea{padding:9px;border:1px solid #b9c8d1;border-radius:6px;margin:0 8px 12px 0;background:white}input[type=text]{width:min(480px,90%)}textarea{width:min(900px,95%);height:180px}
 .actions{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}.button{display:inline-block;padding:10px 14px;border-radius:7px;background:#1f6f8b;color:white;text-decoration:none;font-size:14px}.button:hover{background:#15566d}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
 """
@@ -258,7 +315,7 @@ input{padding:9px;width:min(480px,90%);border:1px solid #b9c8d1;border-radius:6p
 def dashboard_page(data: dict) -> str:
     status = data["status"]
     qualified = int(status.get("qualified_companies", 0))
-    target = int(status.get("target_qualified_companies", 200_000))
+    target = int(status.get("target_qualified_companies", 400_000))
     progress = min(100.0, qualified / target * 100) if target else 0
     state, state_class = collector_state(status)
     totals = data["totals"]
@@ -273,8 +330,8 @@ def dashboard_page(data: dict) -> str:
     ram_state = str(status.get("ram_operating_state", "unknown"))
     ram_class = "good" if ram_state == "healthy" else "bad" if ram_state == "critical" else "warn"
     return f"""<!doctype html><html><head><meta charset='utf-8'>
-    <title>SherlockMaps V3 Progress</title><style>{CSS}</style></head><body>
-    <header><h1>SherlockMaps Malaysia V3</h1><p>Adaptive 200,000-location collector · <a href='/searches'>All searches</a></p>
+    <title>LOCUS-T Lead Intelligence V4</title><style>{CSS}</style></head><body>
+    <header><h1>LOCUS-T Lead Intelligence V4</h1><p>400,000 sales-ready Malaysian locations · focus: Klang Valley 55%, Johor 25%, Penang 20% · <a href='/searches'>Searches</a> · <a href='/leads'>Ranked leads</a> · <a href='/pipeline'>Sales pipeline</a> · <a href='/coverage'>Coverage</a></p>
     <div class='status-strip'>
       <span>Dashboard refreshed: <strong id='dashboard-refresh'>--</strong></span>
       <span><i id='heartbeat-dot' class='dot {state_class}'></i>Collector updated: <strong id='collector-update'>--</strong> (<span id='heartbeat-age'>--</span>)</span>
@@ -298,17 +355,22 @@ def dashboard_page(data: dict) -> str:
     <div class='label'>Updated: {esc(status.get('updated_at'))} · {esc(status.get('halt_reason') or 'No halt reason')}</div>
     <h2>Reports and exports</h2>
     <div class='actions'>
+      <a class='button' href='/export/call-list.csv'>Download A/B call list</a>
       <a class='button' href='/export/companies.csv'>Download companies CSV</a>
       <a class='button' href='/export/companies.xlsx'>Download companies Excel</a>
       <a class='button' href='/export/report.html'>Open summary report</a>
     </div>
-    <div class='small'>Exports are generated from the live SQLite database when clicked. CSV/Excel include qualified locations, lead tier, contact details, Maps identifiers, and provenance.</div>
+    <div class='small'>The call list is organization-deduplicated and excludes suppressed or do-not-contact businesses. Full exports retain every physical location and its provenance.</div>
     <div class='cards' style='margin-top:18px'>
       <div class='card'><div class='label'>Links discovered</div><div class='value'>{int(totals[0]):,}</div></div>
       <div class='card'><div class='label'>Listings processed</div><div class='value'>{int(totals[1]):,}</div></div>
       <div class='card'><div class='label'>Duplicates</div><div class='value'>{int(totals[2]):,}</div></div>
       <div class='card'><div class='label'>Rejected</div><div class='value'>{int(totals[3]):,}</div></div>
     </div>
+    <div class='grid2'><div><h2>Sales-readiness ranks</h2>{table(['Rank','Organizations / locations'],data.get('ranks',[]))}</div>
+    <div><h2>Primary LOCUS-T offer</h2>{table(['Offer','Leads'],data.get('offers',[]))}</div></div>
+    <div class='grid2'><div><h2>Sales pipeline</h2>{table(['Status','Organizations'],data.get('pipeline',[]))}</div>
+    <div><h2>Priority-market coverage</h2>{table(['Market','Locations','A/B leads'],data.get('markets',[]))}</div></div>
     <div class='grid2'><div><h2>Lead tiers</h2>{table(['Tier','Locations'],data['tiers'])}</div>
     <div><h2>States</h2>{table(['State','Locations'],data['states'])}</div></div>
     <h2>Industries</h2>{table(['Industry','Locations'],data['sectors'])}
@@ -363,7 +425,7 @@ def searches_page(query: str = "", page_number: int = 1) -> str:
                duplicate_count,rejected_count,started_at,completed_at,error
           FROM jobs
         UNION ALL
-        SELECT taxonomy_version,'Taxonomy V3',prompt,sector,locality,state,term,
+        SELECT taxonomy_version,CASE taxonomy_version WHEN 4 THEN 'LOCUS-T V4' ELSE 'Taxonomy V3' END,prompt,sector,locality,state,term,
                geo_level,status,attempts,links_discovered,processed_count,qualified_new,
                duplicate_count,rejected_count,started_at,completed_at,error
           FROM search_jobs
@@ -390,12 +452,270 @@ def searches_page(query: str = "", page_number: int = 1) -> str:
     previous_link = f"<a href='/searches?q={encoded_query}&page={page_number-1}'>← Previous</a>" if page_number > 1 else ""
     next_link = f"<a href='/searches?q={encoded_query}&page={page_number+1}'>Next →</a>" if page_number < pages else ""
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='60'>
-    <title>All Searches — SherlockMaps V3</title><style>{CSS}</style></head><body>
-    <header><h1>All Malaysia Search Queries</h1><p><a href='/'>← Dashboard</a> · {total:,} matching queries · page {page_number:,} of {pages:,}</p></header>
+    <title>All Searches — LOCUS-T V4</title><style>{CSS}</style></head><body>
+    <header><h1>All Search Queries</h1><p><a href='/'>← Dashboard</a> · {total:,} matching queries · page {page_number:,} of {pages:,}</p></header>
     <main><form method='get'><input name='q' value='{encoded_query}' placeholder='Filter by prompt, industry, or status'></form>
     <p>{previous_link} &nbsp; {next_link}</p>
     {table(['Taxonomy','Source','Prompt','Industry','Area','State','Term','Geo level','Status','Attempts','Links','Processed','New','Duplicates','Rejected','Started','Completed','Error'],rows)}
     </main></body></html>"""
+
+
+def page(title: str, body: str) -> str:
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title>
+    <style>{CSS}</style></head><body><header><h1>{esc(title)}</h1>
+    <p><a href='/'>Dashboard</a> · <a href='/leads'>Ranked leads</a> · <a href='/pipeline'>Sales pipeline</a> · <a href='/coverage'>Coverage</a> · <a href='/searches'>Searches</a></p>
+    </header><main>{body}</main></body></html>"""
+
+
+def ranked_leads_page(params: dict[str, list[str]]) -> str:
+    filters = {key: values[0] for key, values in params.items() if values}
+    clauses = ["li.intelligence_version=4"]
+    values: list[object] = []
+    for key, column in (
+        ("rank", "li.sales_rank"), ("offer", "li.primary_offer"),
+        ("industry", "COALESCE(ic.industry_label,c.sector)"),
+        ("state", "c.state_name"), ("status", "sl.status"),
+    ):
+        if filters.get(key):
+            clauses.append(f"{column}=?")
+            values.append(filters[key])
+    if filters.get("q"):
+        clauses.append("(c.business_name LIKE ? OR c.phone LIKE ? OR c.website LIKE ?)")
+        values.extend([f"%{filters['q']}%"] * 3)
+    try:
+        page_number = max(1, int(filters.get("page", "1")))
+    except ValueError:
+        page_number = 1
+    conn = connection()
+    where = " AND ".join(clauses)
+    total = int(conn.execute(
+        f"""SELECT COUNT(*) FROM lead_intelligence li JOIN companies c ON c.id=li.company_id
+              LEFT JOIN company_industry_classification ic ON ic.company_id=c.id AND ic.taxonomy_version=4
+              LEFT JOIN sales_leads sl ON sl.organization_id=li.organization_id WHERE {where}""", values
+    ).fetchone()[0])
+    per_page = 200
+    rows = conn.execute(
+        f"""SELECT li.organization_id,c.business_name,COALESCE(ic.industry_label,c.sector),
+                   li.primary_offer,li.sales_readiness_score,li.sales_rank,COALESCE(sl.status,'NEW'),
+                   COALESCE(sl.assigned_pic,''),c.phone,COALESCE(wi.public_email,''),c.website,
+                   c.locality,c.state_name,c.rating,c.reviews_count
+            FROM lead_intelligence li JOIN companies c ON c.id=li.company_id
+            LEFT JOIN company_industry_classification ic ON ic.company_id=c.id AND ic.taxonomy_version=4
+            LEFT JOIN sales_leads sl ON sl.organization_id=li.organization_id
+            LEFT JOIN website_intelligence wi ON wi.company_id=c.id
+            WHERE {where} ORDER BY li.sales_readiness_score DESC,c.id LIMIT ? OFFSET ?""",
+        values + [per_page, (page_number - 1) * per_page],
+    ).fetchall()
+    options: dict[str, list[str]] = {}
+    for name, sql in {
+        "offer": "SELECT DISTINCT primary_offer FROM lead_intelligence WHERE intelligence_version=4 ORDER BY 1",
+        "industry": "SELECT DISTINCT industry_label FROM company_industry_classification WHERE taxonomy_version=4 ORDER BY 1",
+        "state": "SELECT DISTINCT state_name FROM companies WHERE state_name IS NOT NULL ORDER BY 1",
+    }.items():
+        options[name] = [str(row[0]) for row in conn.execute(sql)]
+    conn.close()
+    def choices(name: str, items: list[str]) -> str:
+        selected = filters.get(name, "")
+        return "<option value=''>All " + esc(name) + "s</option>" + "".join(
+            f"<option value='{esc(item)}'{' selected' if item == selected else ''}>{esc(item)}</option>" for item in items
+        )
+    pages = max(1, (total + per_page - 1) // per_page)
+    nav_params = "&".join(f"{esc(k)}={esc(v)}" for k, v in filters.items() if k != "page")
+    previous = f"<a href='/leads?{nav_params}&page={page_number-1}'>Previous</a>" if page_number > 1 else ""
+    next_link = f"<a href='/leads?{nav_params}&page={page_number+1}'>Next</a>" if page_number < pages else ""
+    body = f"""<form method='get'><input type='text' name='q' value='{esc(filters.get('q',''))}' placeholder='Business, phone, or website'>
+      <select name='rank'>{choices('rank', ['A','B','C','D'])}</select>
+      <select name='offer'>{choices('offer', options['offer'])}</select>
+      <select name='industry'>{choices('industry', options['industry'])}</select>
+      <select name='state'>{choices('state', options['state'])}</select>
+      <select name='status'>{choices('status', list(SALES_STATUSES))}</select>
+      <button class='button' type='submit'>Filter</button></form>
+      <p>{total:,} matching locations · page {page_number:,}/{pages:,} · {previous} &nbsp; {next_link}</p>
+      <div class='actions'><a class='button' href='/export/call-list.csv'>Download brand-deduplicated A/B call list</a></div>
+      {table(['Org ID','Business','Industry','Offer','Score','Rank','Status','PIC','Phone','Email','Website','Locality','State','Rating','Reviews'], rows)}"""
+    return page("Ranked LOCUS-T leads", body)
+
+
+CALL_LIST_COLUMNS = [
+    "Organization ID", "Company ID", "Business name", "Industry", "Primary offer",
+    "Sales score", "Sales rank", "Sales status", "Assigned PIC", "Phone", "Public email",
+    "WhatsApp", "Website", "Address", "Locality", "State", "Rating", "Review count",
+    "Maps URL", "Next action at", "Call outcome", "Requirement", "Budget range",
+    "Proposal value", "Proposal URL", "Lost reason", "Notes",
+]
+
+
+def call_list_query() -> str:
+    return """SELECT li.organization_id,c.id,c.business_name,COALESCE(ic.industry_label,c.sector),
+              li.primary_offer,li.sales_readiness_score,li.sales_rank,sl.status,COALESCE(sl.assigned_pic,''),
+              c.phone,COALESCE(wi.public_email,''),COALESCE(wi.whatsapp_url,''),c.website,c.address,
+              c.locality,c.state_name,c.rating,c.reviews_count,c.source_url,COALESCE(sl.next_action_at,''),
+              COALESCE(sl.call_outcome,''),COALESCE(sl.requirement,''),COALESCE(sl.budget_range,''),
+              COALESCE(sl.proposal_value,''),COALESCE(sl.proposal_url,''),COALESCE(sl.lost_reason,''),COALESCE(sl.notes,'')
+       FROM sales_leads sl JOIN lead_intelligence li
+         ON li.company_id=sl.representative_company_id AND li.intelligence_version=4
+       JOIN companies c ON c.id=sl.representative_company_id
+       LEFT JOIN company_industry_classification ic ON ic.company_id=c.id AND ic.taxonomy_version=4
+       LEFT JOIN website_intelligence wi ON wi.company_id=c.id
+       LEFT JOIN contact_suppression cs ON cs.organization_id=sl.organization_id
+       WHERE li.sales_rank IN ('A','B') AND sl.status NOT IN ('DO_NOT_CONTACT','LOST')
+         AND cs.organization_id IS NULL
+       ORDER BY li.sales_readiness_score DESC,sl.organization_id"""
+
+
+def stream_call_list_csv(handler: BaseHTTPRequestHandler) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/csv; charset=utf-8")
+    handler.send_header("Content-Disposition", 'attachment; filename="locus-t-ab-call-list.csv"')
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(CALL_LIST_COLUMNS)
+    handler.wfile.write(("\ufeff" + output.getvalue()).encode("utf-8"))
+    conn = connection()
+    try:
+        for row in conn.execute(call_list_query()):
+            output.seek(0); output.truncate(0)
+            writer.writerow(["" if value is None else value for value in row])
+            handler.wfile.write(output.getvalue().encode("utf-8"))
+    finally:
+        conn.close()
+
+
+def pipeline_page(message: str = "") -> str:
+    conn = connection()
+    funnel = conn.execute(
+        """SELECT status,COUNT(*),SUM(COALESCE(proposal_value,0)) FROM sales_leads
+           GROUP BY status ORDER BY CASE status WHEN 'NEW' THEN 0 WHEN 'REVIEWED' THEN 1
+           WHEN 'CONTACTED' THEN 2 WHEN 'QUALIFIED' THEN 3 WHEN 'DISCOVERY' THEN 4
+           WHEN 'PROPOSAL_SENT' THEN 5 WHEN 'WON' THEN 6 WHEN 'LOST' THEN 7 ELSE 8 END"""
+    ).fetchall()
+    by_pic = conn.execute(
+        """SELECT COALESCE(assigned_pic,'Unassigned'),COUNT(*),
+                  SUM(CASE WHEN status IN ('QUALIFIED','DISCOVERY','PROPOSAL_SENT','WON') THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END),SUM(COALESCE(proposal_value,0))
+           FROM sales_leads GROUP BY assigned_pic ORDER BY COUNT(*) DESC"""
+    ).fetchall()
+    metric_sql = """SELECT {dimension},COUNT(*) leads,
+          ROUND(100.0*SUM(CASE WHEN sl.contact_count>0 OR sl.status NOT IN ('NEW','REVIEWED') THEN 1 ELSE 0 END)/COUNT(*),1),
+          ROUND(100.0*SUM(CASE WHEN sl.status IN ('QUALIFIED','DISCOVERY','PROPOSAL_SENT','WON') THEN 1 ELSE 0 END)/COUNT(*),1),
+          ROUND(100.0*SUM(CASE WHEN sl.status IN ('PROPOSAL_SENT','WON') THEN 1 ELSE 0 END)/COUNT(*),1),
+          ROUND(100.0*SUM(CASE WHEN sl.status='WON' THEN 1 ELSE 0 END)/COUNT(*),1),
+          ROUND(100.0*SUM(CASE WHEN sl.status='WON' THEN COALESCE(sl.proposal_value,0) ELSE 0 END)/COUNT(*),2)
+       FROM sales_leads sl JOIN companies c ON c.id=sl.representative_company_id
+       JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
+       LEFT JOIN company_industry_classification ic ON ic.company_id=c.id AND ic.taxonomy_version=4
+       GROUP BY {dimension} ORDER BY leads DESC"""
+    conversion_by_industry = conn.execute(metric_sql.format(
+        dimension="COALESCE(ic.industry_label,c.sector)"
+    )).fetchall()
+    conversion_by_offer = conn.execute(metric_sql.format(dimension="li.primary_offer")).fetchall()
+    conversion_by_market = conn.execute(metric_sql.format(
+        dimension="CASE WHEN c.state_name IN ('Selangor','Federal Territory') THEN 'Klang Valley' ELSE c.state_name END"
+    )).fetchall()
+    by_query_term = conn.execute(
+        """WITH first_source AS (
+             SELECT p.company_id,MIN(p.prompt) prompt FROM provenance p GROUP BY p.company_id)
+           SELECT COALESCE(sj.term,'Legacy/unmapped'),COUNT(DISTINCT sl.organization_id),
+             ROUND(100.0*COUNT(DISTINCT CASE WHEN sl.contact_count>0 OR sl.status NOT IN ('NEW','REVIEWED') THEN sl.organization_id END)/COUNT(DISTINCT sl.organization_id),1),
+             ROUND(100.0*COUNT(DISTINCT CASE WHEN sl.status IN ('QUALIFIED','DISCOVERY','PROPOSAL_SENT','WON') THEN sl.organization_id END)/COUNT(DISTINCT sl.organization_id),1),
+             ROUND(100.0*COUNT(DISTINCT CASE WHEN sl.status IN ('PROPOSAL_SENT','WON') THEN sl.organization_id END)/COUNT(DISTINCT sl.organization_id),1),
+             ROUND(100.0*COUNT(DISTINCT CASE WHEN sl.status='WON' THEN sl.organization_id END)/COUNT(DISTINCT sl.organization_id),1),
+             ROUND(100.0*SUM(CASE WHEN sl.status='WON' THEN COALESCE(sl.proposal_value,0) ELSE 0 END)/COUNT(DISTINCT sl.organization_id),2)
+           FROM sales_leads sl JOIN first_source fs ON fs.company_id=sl.representative_company_id
+           LEFT JOIN (SELECT prompt,MAX(term) term FROM search_jobs GROUP BY prompt) sj ON sj.prompt=fs.prompt
+           GROUP BY COALESCE(sj.term,'Legacy/unmapped') ORDER BY COUNT(DISTINCT sl.organization_id) DESC LIMIT 50"""
+    ).fetchall()
+    recent = conn.execute(
+        """SELECT sa.organization_id,o.display_name,sa.old_status,sa.new_status,sa.outcome,
+                  sa.notes,sa.created_by,sa.created_at
+           FROM sales_activities sa LEFT JOIN organizations o ON o.id=sa.organization_id
+           ORDER BY sa.id DESC LIMIT 100"""
+    ).fetchall()
+    conn.close()
+    notice = f"<p class='good'>{esc(message)}</p>" if message else ""
+    sample = ",".join(CALL_LIST_COLUMNS) + "\n1,1,Example Business,Construction,SEO_UPGRADE,80,A,CONTACTED,PIC Name,0123456789,,,,,,,,,,,Connected,SEO proposal,RM5k-RM10k,,,Follow up next week"
+    body = f"""{notice}<div class='actions'><a class='button' href='/export/call-list.csv'>Download A/B call-list CSV</a></div>
+      <p>Update the downloaded CSV using valid statuses: {esc(', '.join(SALES_STATUSES))}. Re-importing records an append-only activity. Email and WhatsApp outreach are not enabled.</p>
+      <form id='import-form'><input id='csv-file' type='file' accept='.csv,text/csv' required>
+      <button class='button' type='submit'>Import PIC updates</button></form><pre style='display:none'>{esc(sample)}</pre>
+      <div class='grid2'><div><h2>Funnel</h2>{table(['Status','Organizations','Proposal value'],funnel)}</div>
+      <div><h2>By PIC</h2>{table(['PIC','Leads','Qualified+','Won','Proposal value'],by_pic)}</div></div>
+      <h2>Conversion by industry</h2>{table(['Industry','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100 leads'],conversion_by_industry)}
+      <div class='grid2'><div><h2>Conversion by primary offer</h2>{table(['Offer','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100'],conversion_by_offer)}</div>
+      <div><h2>Conversion by market</h2>{table(['Market','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100'],conversion_by_market)}</div></div>
+      <h2>Conversion by source query term</h2>{table(['Term','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100'],by_query_term)}
+      <h2>Recent sales activity</h2>{table(['Org ID','Organization','From','To','Outcome','Notes','PIC','Time'],recent)}
+      <script>document.getElementById('import-form').addEventListener('submit',async event=>{{event.preventDefault();const file=document.getElementById('csv-file').files[0];
+      const response=await fetch('/import/sales-updates',{{method:'POST',headers:{{'Content-Type':'text/csv; charset=utf-8'}},body:await file.text()}});
+      document.open();document.write(await response.text());document.close();}});</script>"""
+    return page("Sales pipeline and PIC handoff", body)
+
+
+def coverage_page() -> str:
+    conn = connection()
+    market = conn.execute(
+        """SELECT CASE WHEN state IN ('Selangor','Federal Territory') THEN 'Klang Valley' ELSE state END,
+                  COUNT(*),SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
+                  SUM(qualified_new),SUM(ab_leads_new),ROUND(AVG(expected_ab_yield),2)
+           FROM search_jobs WHERE taxonomy_version=4 GROUP BY 1 ORDER BY COUNT(*) DESC"""
+    ).fetchall()
+    yield_rows = conn.execute(
+        """SELECT sector,strategy_bucket,COUNT(*),SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
+                  SUM(qualified_new),SUM(ab_leads_new),ROUND(AVG(expected_ab_yield),2),
+                  ROUND(100.0*SUM(duplicate_count)/NULLIF(SUM(processed_count),0),1)
+           FROM search_jobs WHERE taxonomy_version=4 GROUP BY sector,strategy_bucket
+           ORDER BY SUM(ab_leads_new) DESC,AVG(expected_ab_yield) DESC LIMIT 100"""
+    ).fetchall()
+    coverage = conn.execute(
+        """SELECT c.state_name,COALESCE(ic.industry_label,c.sector),COUNT(*),
+                  SUM(CASE WHEN li.sales_rank IN ('A','B') THEN 1 ELSE 0 END)
+           FROM companies c LEFT JOIN company_industry_classification ic
+             ON ic.company_id=c.id AND ic.taxonomy_version=4
+           LEFT JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
+           WHERE c.state_name IN ('Selangor','Federal Territory','Johor','Penang')
+           GROUP BY c.state_name,2 ORDER BY c.state_name,COUNT(*) DESC"""
+    ).fetchall()
+    conn.close()
+    body = f"""<p>New V4 search allocation: 55% Klang Valley, 25% Johor, 20% Penang. Legacy nationwide data remains available but is not prioritized.</p>
+      <h2>Query allocation and results</h2>{table(['Market','Queries','Completed','Qualified','A/B leads','Expected A/B'],market)}
+      <h2>A/B yield by industry and strategy</h2>{table(['Industry','Strategy','Queries','Completed','Qualified','A/B leads','Expected A/B','Duplicate %'],yield_rows)}
+      <h2>Lead coverage in primary markets</h2>{table(['State','Industry','Locations','A/B leads'],coverage)}"""
+    return page("Coverage and query yield", body)
+
+
+def import_sales_updates(raw: bytes) -> tuple[int, list[str]]:
+    text_value = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text_value))
+    normalized_headers = {str(name).strip().lower().replace(" ", "_"): name for name in (reader.fieldnames or [])}
+    if "organization_id" not in normalized_headers or "sales_status" not in normalized_headers:
+        raise ValueError("CSV must contain Organization ID and Sales status columns")
+    conn = write_connection()
+    updated = 0
+    errors: list[str] = []
+    try:
+        for row_number, source in enumerate(reader, 2):
+            row = {str(key).strip().lower().replace(" ", "_"): value for key, value in source.items()}
+            status = (row.get("sales_status") or "").strip().upper()
+            if not status:
+                continue
+            payload = {
+                "organization_id": row.get("organization_id"), "status": status,
+                "assigned_pic": row.get("assigned_pic"), "next_action_at": row.get("next_action_at"),
+                "call_outcome": row.get("call_outcome"), "requirement": row.get("requirement"),
+                "budget_range": row.get("budget_range"), "proposal_value": row.get("proposal_value"),
+                "proposal_url": row.get("proposal_url"), "lost_reason": row.get("lost_reason"),
+                "notes": row.get("notes"),
+            }
+            try:
+                update_sales_lead(conn, payload, actor=row.get("assigned_pic") or "PIC CSV import")
+                updated += 1
+            except Exception as exc:
+                errors.append(f"Row {row_number}: {exc}")
+    finally:
+        conn.close()
+    return updated, errors
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -411,10 +731,18 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     page_number = 1
                 self.respond(searches_page(query, page_number), "text/html; charset=utf-8")
+            elif parsed.path == "/leads":
+                self.respond(ranked_leads_page(parse_qs(parsed.query)), "text/html; charset=utf-8")
+            elif parsed.path == "/pipeline":
+                self.respond(pipeline_page(), "text/html; charset=utf-8")
+            elif parsed.path == "/coverage":
+                self.respond(coverage_page(), "text/html; charset=utf-8")
             elif parsed.path == "/api/status":
                 self.respond(json.dumps(load_status()), "application/json; charset=utf-8")
             elif parsed.path == "/export/companies.csv":
                 stream_company_csv(self)
+            elif parsed.path == "/export/call-list.csv":
+                stream_call_list_csv(self)
             elif parsed.path == "/export/companies.xlsx":
                 export_path = DB_PATH.parent / "sherlockmaps-companies.xlsx"
                 export_path.write_bytes(company_export_xlsx())
@@ -426,6 +754,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except Exception as exc:
             self.send_error(500, str(exc))
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/import/sales-updates":
+            self.send_error(404)
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size <= 0 or size > 100 * 1024 * 1024:
+                raise ValueError("CSV is empty or exceeds 100 MB")
+            updated, errors = import_sales_updates(self.rfile.read(size))
+            message = f"Imported {updated:,} sales updates."
+            if errors:
+                message += f" {len(errors):,} rows failed: " + "; ".join(errors[:10])
+            self.respond(pipeline_page(message), "text/html; charset=utf-8")
+        except Exception as exc:
+            self.respond(page("Sales import failed", f"<p class='bad'>{esc(exc)}</p><p><a href='/pipeline'>Return to pipeline</a></p>"), "text/html; charset=utf-8")
 
     def respond(self, body: str, content_type: str) -> None:
         content = body.encode("utf-8")

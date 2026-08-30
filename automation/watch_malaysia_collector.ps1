@@ -2,7 +2,7 @@
 # Intended for Windows Task Scheduler. This script does not call Codex or any API.
 
 $ErrorActionPreference = 'Stop'
-$projectRoot = 'C:\Users\WeigW\OneDrive\Desktop\Codex\SherlockMaps'
+$projectRoot = Split-Path -Parent $PSScriptRoot
 $pythonExe = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $collector = 'batch_collect_malaysia.py'
 $dataDir = Join-Path $projectRoot 'data'
@@ -34,7 +34,7 @@ $dashboardHealthy = $false
 if ($dashboardRunning) {
     try {
         $dashboardResponse = Invoke-WebRequest -UseBasicParsing `
-            -Uri 'http://127.0.0.1:8765/' -TimeoutSec 10
+            -Uri 'http://127.0.0.1:8765/api/status' -TimeoutSec 10
         $dashboardHealthy = $dashboardResponse.StatusCode -eq 200
     } catch {
         "$(Get-Date -Format o) dashboard unhealthy: $($_.Exception.Message)" |

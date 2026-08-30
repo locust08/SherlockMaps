@@ -18,12 +18,14 @@ from batch_collect_malaysia_v2 import (
     register_manifest,
     rolling_metrics,
     worker_upscale_stable_seconds,
+    TARGET,
 )
 from core.browser.browser_manager import BrowserManager
 from core.exceptions import MemoryPressureError
 from core.extractors.maps_extractor import MapsExtractor
 from core.models import CrawlerConfig
-from progress_dashboard import dashboard_page
+from lead_intelligence_v4 import backfill_v4, bulk_score_missing, organization_key, update_sales_lead
+from progress_dashboard import call_list_query, dashboard_page
 
 
 class V3CollectorTests(unittest.TestCase):
@@ -44,11 +46,13 @@ class V3CollectorTests(unittest.TestCase):
         self.conn.close()
         self.temp.cleanup()
 
-    def test_manifest_has_national_capacity_and_industries(self) -> None:
+    def test_manifest_has_primary_market_capacity_and_industries(self) -> None:
         manifest = build_manifest()
         self.assertGreaterEqual(len(manifest), 15_000)
         self.assertEqual(len({task.sector for task in manifest}), 26)
         self.assertTrue(set(CLASSIFICATION_ONLY_INDUSTRIES).isdisjoint(SECTOR_TERMS))
+        self.assertEqual(TARGET, 400_000)
+        self.assertEqual({task.state for task in manifest}, {"Selangor", "Federal Territory", "Johor", "Penang"})
 
     def test_website_build_lead_is_accepted(self) -> None:
         reason = persist_observation(self.conn, self.task, {
@@ -65,7 +69,7 @@ class V3CollectorTests(unittest.TestCase):
         tier = self.conn.execute("SELECT lead_tier FROM companies").fetchone()[0]
         self.assertEqual(tier, "WEBSITE_BUILD")
 
-    def test_phone_deduplicates_same_location(self) -> None:
+    def test_phone_deduplicates_without_place_id_but_preserves_distinct_branches(self) -> None:
         base = {
             "name": "Example Dental",
             "category": "Dentist",
@@ -74,9 +78,12 @@ class V3CollectorTests(unittest.TestCase):
             "website": "https://example.test",
             "source_url": "https://www.google.com/maps/place/example",
         }
-        self.assertEqual(persist_observation(self.conn, self.task, dict(base, place_id="one")), "new")
-        self.assertEqual(persist_observation(self.conn, self.task, dict(base, place_id="two", source_url="https://www.google.com/maps/place/example2")), "duplicate")
-        self.assertEqual(qualified_count(self.conn), 1)
+        self.assertEqual(persist_observation(self.conn, self.task, dict(base, address="1 Jalan A", place_id="one")), "new")
+        self.assertEqual(persist_observation(self.conn, self.task, dict(base, address="2 Jalan B", place_id="two", source_url="https://www.google.com/maps/place/example2")), "new")
+        self.assertEqual(qualified_count(self.conn), 2)
+        no_place = dict(base, address="3 Jalan C", source_url="https://maps.example/3")
+        self.assertEqual(persist_observation(self.conn, self.task, no_place), "duplicate")
+        self.assertEqual(qualified_count(self.conn), 2)
 
     def test_irrelevant_listing_is_rejected(self) -> None:
         reason = persist_observation(self.conn, self.task, {
@@ -207,6 +214,51 @@ class V3CollectorTests(unittest.TestCase):
             "sectors": [], "recent": [], "jobs": [], "events": [],
         })
         self.assertIn("2 active / 3 allowed / 4 max", html)
+
+    def test_v4_scoring_organization_and_suppression(self) -> None:
+        reason = persist_observation(self.conn, self.task, {
+            "name": "Klinik Pergigian Sales Ready", "category": "Dental clinic",
+            "address": "Bangsar, Kuala Lumpur, Malaysia", "phone": "+60388889999",
+            "website": "N/A", "place_id": "sales-ready-one",
+            "source_url": "https://www.google.com/maps/place/sales-ready",
+            "rating": "4.8", "reviews_count": "150 reviews",
+        })
+        self.assertEqual(reason, "new")
+        backfill_v4(self.conn)
+        lead = self.conn.execute(
+            "SELECT organization_id,primary_offer,sales_readiness_score,sales_rank FROM lead_intelligence"
+        ).fetchone()
+        self.assertEqual(lead[1], "WEBSITE_BUILD")
+        self.assertIn(lead[3], {"A", "B"})
+        update_sales_lead(self.conn, {
+            "organization_id": lead[0], "status": "DO_NOT_CONTACT",
+            "assigned_pic": "Test PIC", "lost_reason": "Business opt-out",
+        })
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contact_suppression").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(call_list_query()).fetchall(), [])
+
+    def test_shared_social_domain_does_not_merge_unrelated_businesses(self) -> None:
+        row = (1, "Example", "+60120000000", "facebook.com")
+        key, method, _ = organization_key(row)
+        self.assertEqual(key, "phone:+60120000000")
+        self.assertEqual(method, "business_phone")
+
+    def test_bulk_scoring_backfill(self) -> None:
+        persist_observation(self.conn, self.task, {
+            "name": "Bulk Dental Clinic", "category": "Dental clinic",
+            "address": "Bangsar, Kuala Lumpur, Malaysia", "phone": "0312349999",
+            "website": "N/A", "place_id": "bulk-one", "rating": "4.7",
+            "reviews_count": "45 reviews", "source_url": "https://maps.example/bulk",
+        })
+        self.conn.execute("DELETE FROM sales_leads")
+        self.conn.execute("DELETE FROM lead_intelligence")
+        self.assertEqual(bulk_score_missing(self.conn), 1)
+        score = self.conn.execute(
+            "SELECT primary_offer,sales_rank FROM lead_intelligence WHERE intelligence_version=4"
+        ).fetchone()
+        self.assertEqual(score[0], "WEBSITE_BUILD")
+        self.assertIn(score[1], {"A", "B"})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM sales_leads").fetchone()[0], 1)
 
     def test_rolling_metrics_uses_partial_window(self) -> None:
         self.conn.execute(

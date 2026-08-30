@@ -1,4 +1,4 @@
-"""Adaptive, checkpointed Malaysia business collector (V3)."""
+"""Adaptive, checkpointed LOCUS-T Malaysia lead collector (V4)."""
 
 from __future__ import annotations
 
@@ -20,15 +20,25 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from lead_intelligence_v4 import (
+    HIGH_VALUE_INDUSTRIES,
+    INTELLIGENCE_VERSION,
+    PRIMARY_MARKETS,
+    backfill_v4,
+    score_company,
+    sector_ab_fraction,
+    setup_v4_schema,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = DATA_DIR / "malaysia_qualified_companies.sqlite"
 STATUS_PATH = DATA_DIR / "malaysia_batch_status.json"
 LOG_PATH = DATA_DIR / "malaysia_batch.log"
-COLLECTOR_VERSION = 3
-TAXONOMY_VERSION = 3
+COLLECTOR_VERSION = 4
+TAXONOMY_VERSION = 4
 
-TARGET = 200_000
+TARGET = 400_000
 INITIAL_RESULTS = 100
 ADAPTIVE_RESULTS = 200
 HARD_RESULT_CAP = 500
@@ -38,7 +48,7 @@ BASE_WORKERS = 4
 DEFAULT_WORKERS = 5
 MAXIMUM_WORKERS = 6
 MAX_ATTEMPTS = 3
-PILOT_QUERIES = 60
+PILOT_QUERIES = 120
 THROTTLE_COOLDOWN_SECONDS = 15 * 60
 RAM_POLICY_MODE = "adaptive_5_canary_6_max"
 RAM_RESERVE_GB = 1.0
@@ -62,6 +72,8 @@ class QueryTask:
     geo_level: str = "city"
     parent_prompt: str = ""
     priority: int = 100
+    strategy_bucket: str = "commercial"
+    expected_ab_yield: float = 0.0
     initial_results: int = INITIAL_RESULTS
     adaptive_results: int = ADAPTIVE_RESULTS
     hard_result_cap: int = HARD_RESULT_CAP
@@ -146,6 +158,38 @@ SECTOR_TERMS: dict[str, list[str]] = {
     "Interior Design": ["interior designer", "office interior designer", "kitchen designer", "retail interior designer", "interior design firm", "pereka dalaman", "reka bentuk dalaman"],
 }
 
+# V4 adds higher-value, sales-ready searches while retaining V3 provenance.
+V4_EXTRA_TERMS: dict[str, list[str]] = {
+    "Education": ["private school", "international school", "corporate training provider", "培训中心", "补习中心"],
+    "Health, Fitness & Wellness": ["specialist clinic", "dermatology clinic", "fertility clinic", "sports injury clinic", "牙科诊所", "美容诊所"],
+    "Finance": ["chartered accountant", "corporate insurance broker", "business tax advisor", "会计师事务所"],
+    "Property": ["commercial property consultant", "property maintenance company", "industrial property agent", "房地产中介"],
+    "Home Improvement": ["commercial renovation contractor", "office renovation contractor", "kitchen cabinet maker", "solar water heater installer", "装修承包商"],
+    "Industrial & Manufacturing": ["contract manufacturer", "precision engineering company", "plastic injection moulding", "food manufacturer", "OEM manufacturer", "工业供应商"],
+    "Construction": ["design and build contractor", "M&E contractor", "commercial construction contractor", "CIDB contractor", "建筑承包商"],
+    "Automotive": ["continental car workshop", "commercial vehicle workshop", "fleet maintenance service", "汽车维修"],
+    "B2B": ["SME business consultant", "corporate training consultant", "business process outsourcing", "商业顾问"],
+    "Logistics": ["haulage company", "last mile delivery company", "ecommerce fulfilment", "物流公司"],
+    "Pest & Cleaning": ["office cleaning service", "industrial cleaning service", "building maintenance service", "commercial pest control", "清洁服务"],
+    "Interior Design": ["commercial interior design", "office fit out contractor", "retail fit out contractor", "室内设计"],
+    "HR, Events & Entertainment": ["corporate event company", "exhibition contractor", "conference organiser"],
+    "Printing": ["commercial printer", "packaging supplier", "large format printing"],
+    "Hospitality": ["business hotel", "corporate event venue"],
+}
+
+PRIMARY_MARKET_LOCALITIES: list[tuple[str, str]] = [
+    (locality, state) for locality, state in LOCALITIES
+    if state in PRIMARY_MARKETS and locality != "Labuan"
+] + [
+    ("Sungai Buloh", "Selangor"), ("Damansara", "Selangor"),
+    ("Kota Damansara", "Selangor"), ("Seri Kembangan", "Selangor"),
+    ("Bandar Baru Bangi", "Selangor"), ("Balakong", "Selangor"),
+    ("Senai", "Johor"), ("Masai", "Johor"), ("Pontian", "Johor"),
+    ("Segamat", "Johor"), ("Tangkak", "Johor"), ("Kota Tinggi", "Johor"),
+    ("Perai", "Penang"), ("Batu Kawan", "Penang"),
+    ("Kepala Batas", "Penang"), ("Nibong Tebal", "Penang"),
+]
+
 CLASSIFICATION_ONLY_INDUSTRIES = ("Government", "Others")
 
 # Lower values run first. Previously covered Education/Home categories remain
@@ -208,6 +252,13 @@ DENSE_CHILDREN: dict[str, list[str]] = {
     "Alor Setar": ["Mergong", "Anak Bukit", "Simpang Kuala"],
     "Kota Bharu": ["Kubang Kerian", "Wakaf Che Yeh", "Pengkalan Chepa"],
     "Kuala Terengganu": ["Gong Badak", "Batu Buruk", "Chendering"],
+    "Sungai Buloh": ["Bukit Rahman Putra", "Kampung Baru Sungai Buloh", "Sierramas"],
+    "Seri Kembangan": ["Serdang", "Taman Equine", "Putra Permai"],
+    "Bandar Baru Bangi": ["Bangi Gateway", "Seksyen 7 Bangi", "Seksyen 9 Bangi"],
+    "Senai": ["Senai Industrial Park", "Taman Perindustrian Senai", "Kempas"],
+    "Masai": ["Bandar Seri Alam", "Taman Rinting", "Plentong"],
+    "Batu Kawan": ["Batu Kawan Industrial Park", "Bandar Cassia"],
+    "Perai": ["Perai Industrial Estate", "Prai", "Seberang Jaya"],
 }
 
 POSTCODES_BY_STATE: dict[str, list[str]] = {
@@ -238,6 +289,13 @@ def normalized(value: Any) -> str:
 def usable(value: Any) -> str:
     text = str(value or "").strip()
     return "" if text.lower() in {"n/a", "none", "null"} else text
+
+
+def integer_count(value: Any) -> int:
+    match = re.search(r"[\d,.]+", str(value or ""))
+    if not match:
+        return 0
+    return int(re.sub(r"\D", "", match.group(0)) or 0)
 
 
 def normalize_phone(value: Any) -> str:
@@ -362,6 +420,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS ix_companies_name_address ON companies(normalized_name, normalized_address)")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_search_jobs_status_priority ON search_jobs(taxonomy_version,status,priority)")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_classification_industry ON company_industry_classification(taxonomy_version,industry_label)")
+    setup_v4_schema(conn)
     migrate_legacy_data(conn)
     migrate_v3_classifications(conn)
     conn.commit()
@@ -453,7 +512,7 @@ def migrate_v3_classifications(conn: sqlite3.Connection) -> None:
     for company_id, name, category, legacy_sector in rows:
         label, confidence, source = classify_industry(name or "", category or "", legacy_sector or "")
         set_company_classification(conn, int(company_id), label, confidence, source)
-    conn.execute("INSERT OR REPLACE INTO metadata VALUES('v3_classified',?)", (utc_now(),))
+    conn.execute("INSERT OR REPLACE INTO metadata VALUES('v4_classified',?)", (utc_now(),))
 
 
 def setup_logging() -> None:
@@ -466,43 +525,179 @@ def setup_logging() -> None:
     )
 
 
+def market_name(state: str) -> str:
+    if state in {"Selangor", "Federal Territory"}:
+        return "Klang Valley"
+    return state
+
+
+def strategy_for(sector: str, term: str, geo_level: str = "city") -> tuple[str, int]:
+    if geo_level in {"district", "postcode", "industrial_park", "neighbourhood"}:
+        return "long_tail", 20
+    if term in V4_EXTRA_TERMS.get(sector, []):
+        return "experimental", 15 if sector in HIGH_VALUE_INDUSTRIES else 30
+    if sector in HIGH_VALUE_INDUSTRIES:
+        return "high_value", 10
+    if sector in {"F&B", "Retail"}:
+        return "volume_gated", 50
+    return "commercial", 30
+
+
+def expected_ab_yield(conn: sqlite3.Connection | None, sector: str, term: str) -> float:
+    if conn is None:
+        return 4.0
+    row = conn.execute(
+        """SELECT AVG(qualified_new) FROM search_jobs
+           WHERE status='completed' AND sector=? AND term=?""",
+        (sector, term),
+    ).fetchone()
+    if not row or row[0] is None:
+        row = conn.execute(
+            "SELECT AVG(qualified_new) FROM search_jobs WHERE status='completed' AND sector=?",
+            (sector,),
+        ).fetchone()
+    raw_yield = float(row[0] or 8.0)
+    return round(raw_yield * sector_ab_fraction(conn, sector), 2)
+
+
+def yield_estimate_cache(conn: sqlite3.Connection | None) -> dict[tuple[str, str], float]:
+    if conn is None:
+        return {}
+    term_yields = {
+        (str(row[0]), str(row[1])): float(row[2] or 0)
+        for row in conn.execute(
+            """SELECT sector,term,AVG(qualified_new) FROM search_jobs
+               WHERE status='completed' GROUP BY sector,term"""
+        )
+    }
+    sector_yields = {
+        str(row[0]): float(row[1] or 0)
+        for row in conn.execute(
+            """SELECT sector,AVG(qualified_new) FROM search_jobs
+               WHERE status='completed' GROUP BY sector"""
+        )
+    }
+    ab_fractions = {
+        str(row[0]): float(row[1] or 0.35)
+        for row in conn.execute(
+            """SELECT COALESCE(ic.industry_label,c.sector),
+                      AVG(CASE WHEN li.sales_rank IN ('A','B') THEN 1.0 ELSE 0.0 END)
+               FROM companies c
+               LEFT JOIN company_industry_classification ic
+                 ON ic.company_id=c.id AND ic.taxonomy_version=4
+               LEFT JOIN lead_intelligence li
+                 ON li.company_id=c.id AND li.intelligence_version=4
+               GROUP BY COALESCE(ic.industry_label,c.sector)"""
+        )
+    }
+    cache: dict[tuple[str, str], float] = {}
+    for sector, terms in SECTOR_TERMS.items():
+        fraction = ab_fractions.get(sector, 0.35)
+        for term in set(terms + V4_EXTRA_TERMS.get(sector, [])):
+            raw = term_yields.get((sector, term), sector_yields.get(sector, 8.0))
+            cache[(sector, term)] = round(raw * fraction, 2)
+    return cache
+
+
+def weighted_market_order(tasks: list[QueryTask]) -> list[QueryTask]:
+    """Interleave tasks at 55% Klang Valley, 25% Johor, and 20% Penang."""
+    groups: dict[str, deque[QueryTask]] = {name: deque() for name in ("Klang Valley", "Johor", "Penang")}
+    for task in sorted(tasks, key=lambda item: (item.priority, -item.expected_ab_yield, item.term, item.prompt)):
+        groups.setdefault(market_name(task.state), deque()).append(task)
+    cycle = ["Klang Valley"] * 11 + ["Johor"] * 5 + ["Penang"] * 4
+    ordered: list[QueryTask] = []
+    while any(groups.get(name) for name in cycle):
+        progressed = False
+        for name in cycle:
+            if groups.get(name):
+                ordered.append(groups[name].popleft())
+                progressed = True
+        if not progressed:
+            break
+    for group in groups.values():
+        ordered.extend(group)
+    return ordered
+
+
 def build_manifest(conn: sqlite3.Connection | None = None) -> list[QueryTask]:
     tasks: list[QueryTask] = []
-    for locality, state in LOCALITIES:
-        for sector, terms in SECTOR_TERMS.items():
+    estimate_cache = yield_estimate_cache(conn)
+    estimate = lambda sector, term: estimate_cache.get((sector, term), 4.0)
+    completed_prompts: set[str] = set()
+    if conn is not None:
+        completed_prompts = {row[0] for row in conn.execute(
+            "SELECT DISTINCT prompt FROM search_jobs WHERE status='completed'"
+        )}
+    for locality, state in PRIMARY_MARKET_LOCALITIES:
+        for sector, base_terms in SECTOR_TERMS.items():
+            terms = list(dict.fromkeys(base_terms + V4_EXTRA_TERMS.get(sector, [])))
             for term in terms:
+                prompt = f"{term} in {locality}, {state}, Malaysia"
+                if prompt in completed_prompts:
+                    continue
+                bucket, priority = strategy_for(sector, term)
                 tasks.append(QueryTask(
-                    prompt=f"{term} in {locality}, {state}, Malaysia",
-                    sector=sector, locality=locality, state=state, term=term,
-                    geo_level="city", priority=SECTOR_PRIORITY[sector],
+                    prompt=prompt, sector=sector, locality=locality, state=state, term=term,
+                    geo_level="city", priority=priority, strategy_bucket=bucket,
+                    expected_ab_yield=estimate(sector, term),
                 ))
     if conn is not None:
+        # Carry forward unfinished V3 prompts in the selected conversion markets.
+        carry_forward = conn.execute(
+            """SELECT prompt,sector,locality,state,term,geo_level,parent_prompt
+               FROM search_jobs WHERE taxonomy_version=3 AND status<>'completed'
+                 AND state IN ('Selangor','Federal Territory','Johor','Penang')"""
+        ).fetchall()
+        for prompt, sector, locality, state, term, geo_level, parent_prompt in carry_forward:
+            if prompt in completed_prompts:
+                continue
+            bucket, priority = strategy_for(sector, term, geo_level)
+            tasks.append(QueryTask(
+                prompt=prompt, sector=sector, locality=locality, state=state, term=term,
+                geo_level=geo_level, parent_prompt=parent_prompt or "", priority=priority,
+                strategy_bucket=bucket, expected_ab_yield=estimate(sector, term),
+            ))
         saturated = conn.execute(
-            """SELECT prompt,sector,locality,state,term FROM search_jobs
-               WHERE taxonomy_version=? AND geo_level='city' AND status='completed'
+            """SELECT prompt,sector,locality,state,term,strategy_bucket,expected_ab_yield
+               FROM search_jobs WHERE taxonomy_version=? AND geo_level='city' AND status='completed'
                  AND (links_discovered>=80 OR processed_count>=100 OR qualified_new>=20)""",
             (TAXONOMY_VERSION,),
         ).fetchall()
-        for prompt, sector, locality, state, term in saturated:
+        for prompt, sector, locality, state, term, bucket, estimate in saturated:
             tasks.extend(expand_task(QueryTask(
                 prompt=prompt, sector=sector, locality=locality, state=state, term=term,
+                strategy_bucket=bucket or "long_tail", expected_ab_yield=float(estimate or 0),
             )))
         existing_children = conn.execute(
-            """SELECT prompt,sector,locality,state,term,geo_level,parent_prompt,priority
+            """SELECT prompt,sector,locality,state,term,geo_level,parent_prompt,priority,
+                      strategy_bucket,expected_ab_yield
                FROM search_jobs WHERE taxonomy_version=? AND geo_level<>'city'""",
             (TAXONOMY_VERSION,),
         ).fetchall()
         tasks.extend(QueryTask(
             prompt=row[0], sector=row[1], locality=row[2], state=row[3], term=row[4],
             geo_level=row[5], parent_prompt=row[6] or "", priority=int(row[7]),
+            strategy_bucket=row[8] or "long_tail", expected_ab_yield=float(row[9] or 0),
         ) for row in existing_children)
+    # Keep a deep, conversion-market-only reserve ready. Dynamic expansion remains
+    # the main source of children, but pre-seeding the highest-value branches
+    # guarantees at least 15,000 uncompleted prompts after restart.
+    existing_prompts = {task.prompt for task in tasks}
+    if len(existing_prompts) < 15_500:
+        for parent in list(tasks):
+            if parent.sector not in HIGH_VALUE_INDUSTRIES or parent.geo_level != "city":
+                continue
+            for child in expand_task(parent):
+                if child.prompt in completed_prompts or child.prompt in existing_prompts:
+                    continue
+                tasks.append(child)
+                existing_prompts.add(child.prompt)
+                if len(existing_prompts) >= 15_500:
+                    break
+            if len(existing_prompts) >= 15_500:
+                break
     unique = {task.prompt: task for task in tasks}
-    dense_order = {name: index for index, name in enumerate(DENSE_CHILDREN)}
-    sector_order = {name: index for index, name in enumerate(SECTOR_TERMS)}
-    return sorted(unique.values(), key=lambda task: (
-        task.priority, dense_order.get(task.locality, 999),
-        sector_order[task.sector], task.term, task.prompt,
-    ))
+    return weighted_market_order(list(unique.values()))
 
 
 def expand_task(task: QueryTask) -> list[QueryTask]:
@@ -512,37 +707,35 @@ def expand_task(task: QueryTask) -> list[QueryTask]:
         prompt=f"{task.term} in {child}, {task.state}, Malaysia",
         sector=task.sector, locality=child, state=task.state, term=task.term,
         geo_level="district", parent_prompt=task.prompt, priority=task.priority + 10,
+        strategy_bucket="long_tail", expected_ab_yield=task.expected_ab_yield,
     ) for child in DENSE_CHILDREN.get(task.locality, [])]
     children.extend(QueryTask(
         prompt=f"{task.term} in {postcode}, {task.state}, Malaysia",
         sector=task.sector, locality=postcode, state=task.state, term=task.term,
         geo_level="postcode", parent_prompt=task.prompt, priority=task.priority + 20,
+        strategy_bucket="long_tail", expected_ab_yield=task.expected_ab_yield,
     ) for postcode in POSTCODES_BY_STATE.get(task.state, []))
     return children
 
 
 def register_manifest(conn: sqlite3.Connection, manifest: list[QueryTask]) -> None:
-    for task in manifest:
-        existing = conn.execute(
-            "SELECT status FROM search_jobs WHERE taxonomy_version=? AND prompt=?",
-            (task.taxonomy_version, task.prompt),
-        ).fetchone()
-        if existing:
-            conn.execute(
-                """UPDATE search_jobs SET priority=?,sector=?,locality=?,state=?,term=?,geo_level=?,parent_prompt=?
-                   WHERE taxonomy_version=? AND prompt=?""",
-                (task.priority, task.sector, task.locality, task.state, task.term,
-                 task.geo_level, task.parent_prompt, task.taxonomy_version, task.prompt),
-            )
-            continue
-        conn.execute(
-            """INSERT INTO search_jobs(
-                   taxonomy_version,prompt,sector,locality,state,term,geo_level,
-                   parent_prompt,priority,status)
-               VALUES(?,?,?,?,?,?,?,?,?,'pending')""",
-            (task.taxonomy_version, task.prompt, task.sector, task.locality,
-             task.state, task.term, task.geo_level, task.parent_prompt, task.priority),
-        )
+    conn.executemany(
+        """INSERT INTO search_jobs(
+               taxonomy_version,prompt,sector,locality,state,term,geo_level,
+               parent_prompt,priority,status,strategy_bucket,expected_ab_yield)
+           VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?)
+           ON CONFLICT(taxonomy_version,prompt) DO UPDATE SET
+               priority=excluded.priority,sector=excluded.sector,locality=excluded.locality,
+               state=excluded.state,term=excluded.term,geo_level=excluded.geo_level,
+               parent_prompt=excluded.parent_prompt,strategy_bucket=excluded.strategy_bucket,
+               expected_ab_yield=excluded.expected_ab_yield""",
+        [
+            (task.taxonomy_version, task.prompt, task.sector, task.locality, task.state,
+             task.term, task.geo_level, task.parent_prompt, task.priority,
+             task.strategy_bucket, task.expected_ab_yield)
+            for task in manifest
+        ],
+    )
     conn.commit()
 
 
@@ -556,7 +749,10 @@ def find_existing_company(conn: sqlite3.Connection, place_id: str, phone: str, n
         row = conn.execute("SELECT id FROM companies WHERE maps_place_id=?", (place_id,)).fetchone()
         if row:
             return row
-    if phone:
+    # A distinct stable Place ID represents a distinct physical branch even when
+    # a chain shares one central phone/domain. Fall back to phone only when Maps
+    # did not expose a stable location identifier.
+    if phone and not place_id:
         row = conn.execute("SELECT id FROM companies WHERE normalized_phone=?", (phone,)).fetchone()
         if row:
             return row
@@ -564,7 +760,10 @@ def find_existing_company(conn: sqlite3.Connection, place_id: str, phone: str, n
     if row:
         return row
     if domain:
-        return conn.execute("SELECT id FROM companies WHERE website_domain=? AND normalized_name=?", (domain, name)).fetchone()
+        return conn.execute(
+            "SELECT id FROM companies WHERE website_domain=? AND normalized_name=? AND normalized_address=?",
+            (domain, name, address),
+        ).fetchone()
     return None
 
 
@@ -579,6 +778,7 @@ def save_one_result(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, An
     domain = website_domain(website)
     place_id = usable(raw.get("place_id"))
     source_url = usable(raw.get("source_url"))
+    reviews_count = integer_count(raw.get("reviews_count"))
     if bool(raw.get("is_closed")):
         return "permanently_closed", None
     if not name or not address:
@@ -598,11 +798,13 @@ def save_one_result(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, An
                website=CASE WHEN website='' THEN ? ELSE website END,
                website_domain=CASE WHEN website_domain='' THEN ? ELSE website_domain END,
                maps_place_id=COALESCE(NULLIF(maps_place_id,''),?), source_url=COALESCE(NULLIF(source_url,''),?),
-               qualification_score=MAX(qualification_score,?) WHERE id=?""",
-            (now, phone, website, domain, place_id, source_url, score, company_id),
+               qualification_score=MAX(qualification_score,?),reviews_count=MAX(COALESCE(reviews_count,0),?),
+               operational_status='active',listing_checked_at=? WHERE id=?""",
+            (now, phone, website, domain, place_id, source_url, score, reviews_count, now, company_id),
         )
         conn.execute("INSERT OR IGNORE INTO provenance(company_id,prompt,seen_at) VALUES(?,?,?)", (company_id, task.prompt, now))
         set_company_classification(conn, company_id, task.sector, 90, "search_term")
+        score_company(conn, company_id)
         return "duplicate", company_id
     identity_source = f"place:{place_id}" if place_id else (f"phone:{phone}" if phone else f"location:{norm_name}|{norm_address}")
     identity = identity_source
@@ -614,19 +816,22 @@ def save_one_result(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, An
         """INSERT INTO companies(identity,sector,business_name,maps_category,address,city_state,
            phone,website,website_domain,rating,opening_hours,plus_code,first_seen_at,last_seen_at,
            maps_place_id,source_url,lead_tier,parent_brand_key,qualification_score,country,state_name,
-           locality,geo_level,normalized_name,normalized_address,normalized_phone,website_audit_status)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           locality,geo_level,normalized_name,normalized_address,normalized_phone,website_audit_status,
+           reviews_count,operational_status,listing_checked_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (identity, task.sector, name, category, address, f"{task.locality}, {task.state}", phone,
          website, domain, usable(raw.get("rating")), usable(raw.get("opening_hours")),
          usable(raw.get("plus_code")), now, now, place_id, source_url, lead_tier,
          parent_brand_key(name), score, "Malaysia", task.state, task.locality, task.geo_level,
-         norm_name, norm_address, phone, "pending" if website else "not_applicable"),
+         norm_name, norm_address, phone, "pending" if website else "not_applicable",
+         reviews_count, "active", now),
     )
     company_id = int(cursor.lastrowid)
     conn.execute("INSERT OR IGNORE INTO provenance(company_id,prompt,seen_at) VALUES(?,?,?)", (company_id, task.prompt, now))
     set_company_classification(conn, company_id, task.sector, 90, "search_term")
     if website:
         conn.execute("INSERT OR IGNORE INTO website_audits(company_id,status) VALUES(?,'pending')", (company_id,))
+    score_company(conn, company_id)
     return "new", company_id
 
 
@@ -637,6 +842,7 @@ def persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str
     if existing:
         if existing[1]:
             set_company_classification(conn, int(existing[1]), task.sector, 90, "search_term")
+            score_company(conn, int(existing[1]))
             conn.commit()
         return "duplicate_observation"
     reason, company_id = save_one_result(conn, task, raw)
@@ -774,7 +980,7 @@ def record_event(conn: sqlite3.Connection, event_type: str, details: str, worker
 
 
 def record_checkpoints(conn: sqlite3.Connection, count: int, target: int) -> None:
-    for threshold in (10_000, 25_000, 50_000, 100_000, 150_000, target):
+    for threshold in (10_000, 25_000, 50_000, 100_000, 150_000, 200_000, 300_000, target):
         if count >= threshold:
             conn.execute("INSERT OR IGNORE INTO checkpoints(name,qualified_count,reached_at) VALUES(?,?,?)", (str(threshold), count, utc_now()))
 
@@ -836,6 +1042,14 @@ def write_status(
         "SELECT status,COUNT(*) FROM search_jobs WHERE taxonomy_version=? GROUP BY status",
         (TAXONOMY_VERSION,),
     ).fetchall())
+    lead_ranks = dict(conn.execute(
+        """SELECT sales_rank,COUNT(*) FROM lead_intelligence
+           WHERE intelligence_version=4 GROUP BY sales_rank"""
+    ).fetchall())
+    offers = dict(conn.execute(
+        """SELECT primary_offer,COUNT(*) FROM lead_intelligence
+           WHERE intelligence_version=4 GROUP BY primary_offer"""
+    ).fetchall())
     metrics_24h = rolling_metrics(conn, 24)
     metrics_1h = rolling_metrics(conn, 1)
     rate = float(metrics_24h["qualified_rate"])
@@ -873,6 +1087,9 @@ def write_status(
         "qualified_added_24h": metrics_24h["qualified_added"],
         "qualified_rate_per_hour_24h": metrics_24h["qualified_rate"],
         "eta_hours": eta, "pilot_status": pilot_status, "job_status_counts": jobs,
+        "lead_rank_counts": lead_ranks, "primary_offer_counts": offers,
+        "primary_markets": ["Klang Valley", "Johor", "Penang"],
+        "market_query_allocation": {"Klang Valley": 55, "Johor": 25, "Penang": 20},
         "uptime_seconds": int(time.time() - started_at), "halt_reason": halt_reason,
         "database": str(DB_PATH),
     }, indent=2)
@@ -885,28 +1102,52 @@ def low_yield_siblings(conn: sqlite3.Connection, task: QueryTask) -> bool:
     if not task.parent_prompt:
         return False
     rows = conn.execute(
-        """SELECT qualified_new FROM search_jobs WHERE taxonomy_version=? AND parent_prompt=?
-           AND term=? AND status='completed' ORDER BY completed_at DESC LIMIT 2""",
-        (TAXONOMY_VERSION, task.parent_prompt, task.term),
+        """SELECT ab_leads_new,duplicate_count,processed_count FROM search_jobs
+           WHERE taxonomy_version=? AND parent_prompt=? AND term=? AND status='completed'
+           ORDER BY completed_at DESC LIMIT 2""",
+        (task.taxonomy_version, task.parent_prompt, task.term),
     ).fetchall()
-    return len(rows) == 2 and all(int(row[0]) < 3 for row in rows)
+    if len(rows) != 2:
+        return False
+    low_ab = all(int(row[0] or 0) < 3 for row in rows)
+    duplicate_saturated = all(
+        int(row[2] or 0) > 0 and int(row[1] or 0) / int(row[2]) >= 0.80 for row in rows
+    )
+    return low_ab or duplicate_saturated
+
+
+def count_ab_leads_for_prompt(conn: sqlite3.Connection, task: QueryTask) -> int:
+    row = conn.execute(
+        "SELECT started_at FROM search_jobs WHERE taxonomy_version=? AND prompt=?",
+        (task.taxonomy_version, task.prompt),
+    ).fetchone()
+    started_at = row[0] if row else None
+    return int(conn.execute(
+        """SELECT COUNT(DISTINCT p.company_id) FROM provenance p
+           JOIN companies c ON c.id=p.company_id
+           JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
+           WHERE p.prompt=? AND li.sales_rank IN ('A','B')
+             AND (? IS NULL OR julianday(c.first_seen_at)>=julianday(?))""",
+        (task.prompt, started_at, started_at),
+    ).fetchone()[0])
 
 
 def run_batch(args: argparse.Namespace) -> int:
     setup_logging()
     started_at = time.time()
     conn = open_db()
-    # A previous V3 process may have been interrupted after marking jobs running.
+    backfilled = backfill_v4(conn)
+    logging.info("V4 intelligence backfill refreshed %s existing leads", backfilled)
+    # A previous process may have been interrupted after marking jobs running.
     # They are safe to resume because every observation is persisted and deduplicated.
     conn.execute(
         """UPDATE search_jobs SET status='pending',worker_id=NULL,error='Resuming after collector restart'
-           WHERE taxonomy_version=? AND status='running'""",
-        (TAXONOMY_VERSION,),
+           WHERE taxonomy_version IN (3,4) AND status='running'""",
     )
     conn.commit()
     manifest = build_manifest(conn)
     register_manifest(conn, manifest)
-    logging.info("V3 manifest contains %s queries; target=%s", len(manifest), args.target)
+    logging.info("V4 manifest contains %s queries; target=%s", len(manifest), args.target)
     if args.dry_run:
         print(json.dumps({"queries": len(manifest), "initial_capacity": len(manifest) * args.initial_results,
                           "hard_capacity": len(manifest) * args.hard_result_cap, "target": args.target}))
@@ -921,8 +1162,8 @@ def run_batch(args: argparse.Namespace) -> int:
                                            scroll_timeout=args.scroll_timeout) for task in manifest}
     pending = deque(task for task in task_by_prompt.values() if conn.execute(
         "SELECT status FROM search_jobs WHERE taxonomy_version=? AND prompt=?",
-        (TAXONOMY_VERSION, task.prompt),
-    ).fetchone()[0] != "completed")
+        (task.taxonomy_version, task.prompt),
+    ).fetchone()[0] in {"pending", "failed"})
     active: dict[concurrent.futures.Future[CrawlOutcome], QueryTask] = {}
     outcomes = deque(maxlen=20)
     throttle_times: deque[float] = deque()
@@ -1084,12 +1325,13 @@ def run_batch(args: argparse.Namespace) -> int:
                     if not memory_reclaimed:
                         logging.error("FAILED %s: %s", task.prompt, outcome.error)
                 else:
+                    ab_leads_new = count_ab_leads_for_prompt(conn, task)
                     conn.execute(
                         """UPDATE search_jobs SET status='completed',completed_at=?,source_count=?,links_discovered=?,
-                           processed_count=?,qualified_new=?,duplicate_count=?,rejected_count=?,error=NULL
+                           processed_count=?,qualified_new=?,duplicate_count=?,rejected_count=?,ab_leads_new=?,error=NULL
                            WHERE taxonomy_version=? AND prompt=?""",
                         (utc_now(), outcome.processed_count, outcome.links_discovered, outcome.processed_count,
-                         outcome.new_count, outcome.duplicate_count, outcome.rejected_count,
+                         outcome.new_count, outcome.duplicate_count, outcome.rejected_count, ab_leads_new,
                          TAXONOMY_VERSION, task.prompt),
                     )
                     completed_v3 += 1
@@ -1102,9 +1344,9 @@ def run_batch(args: argparse.Namespace) -> int:
                         five_worker_canary_prompts.discard(task.prompt)
                     diagnostics["page_recycle_count"] += outcome.page_recycle_count
                     diagnostics["memory_cleanup_count"] += outcome.memory_cleanup_count
-                    logging.info("DONE %s: %s links / %s processed / %s new / %s duplicate / %s rejected",
+                    logging.info("DONE %s: %s links / %s processed / %s new / %s A/B / %s duplicate / %s rejected",
                                  task.prompt, outcome.links_discovered, outcome.processed_count,
-                                 outcome.new_count, outcome.duplicate_count, outcome.rejected_count)
+                                 outcome.new_count, ab_leads_new, outcome.duplicate_count, outcome.rejected_count)
                     if outcome.links_discovered >= 80 or outcome.processed_count >= 100 or outcome.new_count >= 20:
                         children = [replace(child, initial_results=args.initial_results,
                                             adaptive_results=args.adaptive_results,

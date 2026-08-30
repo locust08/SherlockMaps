@@ -1,6 +1,6 @@
-# SherlockMaps Malaysia — portable setup
+# LOCUS-T Lead Intelligence V4 — portable setup
 
-This repository contains the crawler, dashboard, taxonomy/search manifest logic, RAM-aware browser scheduling, and Windows watchdog. The live crawl database is intentionally **not** stored in GitHub: it is large, changes continuously, and may contain business contact data.
+Read `CODEX_HANDOFF.md` first for the business goal, lead scoring, PIC workflow and safety rules. This repository contains the crawler, sales dashboard, taxonomy/search manifest logic, RAM-aware browser scheduling, and Windows watchdog. The live crawl database is intentionally **not** stored in GitHub: it is large, changes continuously, and contains business and sales-workflow data.
 
 ## 1. Install on the new Windows PC
 
@@ -48,7 +48,9 @@ cd path\to\SherlockMaps
 
 Open [http://localhost:8765/](http://localhost:8765/). The collector resumes pending searches from SQLite; it does not start from zero.
 
-The dashboard provides live progress and buttons for CSV, Excel, and HTML summary exports. Generated Excel files are written to `data\sherlockmaps-companies.xlsx`.
+The dashboard provides live progress, ranked leads, market/industry coverage, a sales pipeline, a brand-deduplicated A/B call-list CSV, full CSV/Excel exports and PIC CSV re-import. Generated Excel files are written to `data\sherlockmaps-companies.xlsx`.
+
+V4 resumes toward 400,000 unique locations. New searches focus on Klang Valley, Johor and Penang; legacy nationwide locations and provenance remain unchanged.
 
 ## 4. Optional automatic restart after sign-in
 
@@ -58,7 +60,7 @@ Run this once in PowerShell from the repository folder:
 powershell -ExecutionPolicy Bypass -File automation\install_malaysia_watchdog.ps1
 ```
 
-The task starts after the Windows user signs in and checks every five minutes. It restarts missing or unresponsive dashboard/collector processes without creating duplicates. Windows must remain awake and connected to the internet while crawling.
+The task starts after the Windows user signs in and checks every five minutes. It restarts missing or unresponsive dashboard, collector and website-enrichment processes without creating duplicates. Windows must remain awake and connected to the internet while crawling.
 
 ## 5. Useful checks
 
@@ -74,4 +76,6 @@ The status file reports qualified companies, active browsers, free RAM, query ra
 - Never run two collectors against the same SQLite database.
 - Stop the collector before copying SQLite WAL/SHM files.
 - Keep the database and exports private; they contain collected business data.
+- Preserve organization-level `DO_NOT_CONTACT` suppression across every branch and device transfer.
+- Default outreach is a human call to published business lines; email/WhatsApp outreach is disabled unless compliance approval is documented.
 - The collector does not use Codex tokens. It runs locally through Python/Playwright.
