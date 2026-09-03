@@ -7,6 +7,8 @@ import csv
 import io
 import json
 import sqlite3
+import threading
+import time
 import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,12 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "malaysia_qualified_companies.sqlite"
 STATUS_PATH = ROOT / "data" / "malaysia_batch_status.json"
 PORT = 8765
+DASHBOARD_CACHE_SECONDS = 120
+
+_dashboard_cache_lock = threading.Lock()
+_dashboard_cache: dict | None = None
+_dashboard_cache_at = 0.0
+_dashboard_refresh_running = False
 
 
 def esc(value: object) -> str:
@@ -55,6 +63,9 @@ def navigation(active: str = "") -> str:
 def connection() -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
     conn.execute("PRAGMA busy_timeout=20000")
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA temp_store=FILE")
+    conn.execute("PRAGMA cache_size=-32768")
     return conn
 
 
@@ -308,6 +319,47 @@ def read_dashboard_data() -> dict:
     return {"status": status, "sectors": sectors, "tiers": tiers, "states": states,
             "recent": recent, "jobs": jobs, "events": events, "totals": totals,
             "ranks": ranks, "offers": offers, "pipeline": pipeline, "markets": markets}
+
+
+def _empty_dashboard_data() -> dict:
+    """Return an immediately renderable shell while analytics warm in the background."""
+    return {
+        "status": load_status(), "sectors": [], "tiers": [], "states": [],
+        "recent": [], "jobs": [], "events": [], "totals": (0, 0, 0, 0),
+        "ranks": [], "offers": [], "pipeline": [], "markets": [],
+    }
+
+
+def _refresh_dashboard_cache() -> None:
+    global _dashboard_cache, _dashboard_cache_at, _dashboard_refresh_running
+    try:
+        fresh = read_dashboard_data()
+        with _dashboard_cache_lock:
+            _dashboard_cache = fresh
+            _dashboard_cache_at = time.monotonic()
+    finally:
+        with _dashboard_cache_lock:
+            _dashboard_refresh_running = False
+
+
+def dashboard_data() -> dict:
+    """Serve cached analytics and ensure only one expensive refresh runs at a time."""
+    global _dashboard_cache, _dashboard_refresh_running
+    now = time.monotonic()
+    with _dashboard_cache_lock:
+        if _dashboard_cache is None:
+            _dashboard_cache = _empty_dashboard_data()
+        expired = now - _dashboard_cache_at >= DASHBOARD_CACHE_SECONDS
+        if expired and not _dashboard_refresh_running:
+            _dashboard_refresh_running = True
+            threading.Thread(
+                target=_refresh_dashboard_cache,
+                name="dashboard-analytics-refresh",
+                daemon=True,
+            ).start()
+        snapshot = dict(_dashboard_cache)
+    snapshot["status"] = load_status()
+    return snapshot
 
 
 CSS = """
@@ -741,7 +793,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in ("/", "/index.html"):
-                self.respond(dashboard_page(read_dashboard_data()), "text/html; charset=utf-8")
+                self.respond(dashboard_page(dashboard_data()), "text/html; charset=utf-8")
             elif parsed.path == "/searches":
                 query = parse_qs(parsed.query).get("q", [""])[0]
                 try:
@@ -766,7 +818,7 @@ class Handler(BaseHTTPRequestHandler):
                 export_path.write_bytes(company_export_xlsx())
                 self.download_file(export_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "sherlockmaps-companies.xlsx")
             elif parsed.path == "/export/report.html":
-                report = report_page(read_dashboard_data()).encode("utf-8")
+                report = report_page(dashboard_data()).encode("utf-8")
                 self.download(report, "text/html; charset=utf-8", "sherlockmaps-report.html", inline=True)
             else:
                 self.send_error(404)
