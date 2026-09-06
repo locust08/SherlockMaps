@@ -92,6 +92,8 @@ app_instance: Optional[FastAPI] = None
 # created with ``asyncio.create_task`` can be garbage-collected mid-execution.
 # Keep strong references to all background tasks until they finish.
 _background_tasks: set[asyncio.Task] = set()
+_crawl_dispatch_lock = asyncio.Lock()
+_email_dispatch_lock = asyncio.Lock()
 
 
 def spawn_background_task(coro) -> asyncio.Task:
@@ -965,6 +967,13 @@ app = _create_app()
 
 
 async def _process_job(job_id: str) -> None:
+    # The API queue reports one active job. Serialize its browser work; the
+    # separate Malaysia batch scheduler retains its own adaptive worker pool.
+    async with _crawl_dispatch_lock:
+        await _process_next_job(job_id)
+
+
+async def _process_next_job(job_id: str) -> None:
     """Process a single crawl job in the background.
 
     This function runs the actual crawl operation in a separate process
@@ -976,6 +985,10 @@ async def _process_job(job_id: str) -> None:
     if not job:
         logger.warning("Job %s not found in queue or already processed", job_id[:8])
         return
+
+    # Dispatch callbacks can arrive out of order; results belong to the job
+    # actually dequeued, never the ID attached to the callback that woke us.
+    job_id = job.job_id
 
     logger.info(
         "Processing job %s for prompt: %s (track_reviews=%s, auto_email_crawl=%s)",
@@ -998,6 +1011,9 @@ async def _process_job(job_id: str) -> None:
             track_reviews=job.track_reviews,
         )
         results = await loop.run_in_executor(None, crawl_call)
+
+        if job.status == JobStatus.CANCELLED:
+            return
 
         await queue_manager.complete_job(job_id, results)
 
@@ -1031,10 +1047,16 @@ async def _process_job(job_id: str) -> None:
 
     except Exception as e:
         logger.exception("Job %s failed: %s", job_id[:8], e)
-        await queue_manager.fail_job(job_id, str(e))
+        if job.status != JobStatus.CANCELLED:
+            await queue_manager.fail_job(job_id, str(e))
 
 
 async def _process_email_job(job_id: str) -> None:
+    async with _email_dispatch_lock:
+        await _process_next_email_job(job_id)
+
+
+async def _process_next_email_job(job_id: str) -> None:
     """Process a single email crawl job in the background.
 
     This function crawls all websites from the parent job and extracts email addresses.
@@ -1044,6 +1066,8 @@ async def _process_email_job(job_id: str) -> None:
     if not email_job:
         logger.warning("Email job %s not found in queue or already processed", job_id[:8])
         return
+
+    job_id = email_job.job_id
 
     logger.info(
         "Processing email job %s for parent job %s (websites: %d)",
@@ -1069,11 +1093,15 @@ async def _process_email_job(job_id: str) -> None:
             config=email_config,
         )
 
+        if email_job.status == JobStatus.CANCELLED:
+            return
         await queue_manager.complete_email_job(job_id, emails)
         logger.info("Email job %s completed: %d emails found", job_id[:8], len(emails))
 
     except Exception as e:
         logger.exception("Email job %s failed: %s", job_id[:8], e)
+        if email_job.status == JobStatus.CANCELLED:
+            return
         await queue_manager.fail_email_job(job_id, str(e))
 
         # Set email_status to "failed" for all companies in the parent job

@@ -42,6 +42,22 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Sixth checkpoint: API dispatch correctness and bounded concurrency
+
+Standalone API crawl and email callbacks now serialize their respective queues,
+matching their single-active-job state. Each callback uses the actual dequeued
+job ID for completion/failure, eliminating cross-job result attribution when
+callbacks arrive out of order. Cancelled running jobs discard late results and
+do not trigger automatic email extraction or become failed on a late exception.
+An in-flight browser is still allowed to finish before releasing its queue slot;
+this change does not claim immediate browser termination on cancellation.
+
+The Malaysia batch ProcessPoolExecutor is independent and retains adaptive
+concurrency. Three integration tests isolate API stores in a temporary directory
+and use no network: reordered callbacks with a maximum of one active crawl,
+cancelled-job handling, and email result identity. The full 30-test suite passes.
+No production API or collector restart has been performed for these checkpoints.
+
 ### Fifth checkpoint: worker import isolation
 
 Moved the shared synchronous crawl function unchanged into `core/crawl_runner.py`.
