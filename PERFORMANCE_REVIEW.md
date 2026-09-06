@@ -42,6 +42,27 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Ninth checkpoint: backed-up production rollout
+
+All 33 tests passed before rollout. On 6 September at 18:06 MYT, temporarily
+disabled the watchdog, stopped the verified collector process tree, and removed
+four multiprocessing workers whose September 3 parent no longer existed. These
+were confirmed by parent PID, command line and creation time; no user browser
+processes were targeted.
+
+Added `automation/backup_database.py` using SQLite's backup API, an exclusive
+timestamped destination and `PRAGMA quick_check`. The actual backup under
+`data/backups/before-optimization-20260906T100644176913Z.sqlite` passed quick_check,
+contains 206,042 companies and is 2,840,104,960 bytes. It remains excluded from git.
+
+Re-enabled the scheduled watchdog and resumed through its existing script at
+18:07 MYT. Controller PID 17996 (launcher 30056) rebuilt the manifest and started
+queries successfully. At 18:08 the status endpoint returned a fresh heartbeat,
+three active browsers, 4.23 GB available RAM and no halt reason. Grouped contact
+extraction remains disabled. This proves startup, not sustained throughput:
+durable new observations, completed-query outcomes and post-rollout metrics
+still require inspection before closing the goal.
+
 ### Eighth checkpoint: measured sales-yield scheduling
 
 Read-only 24-hour analysis: 786 completed queries, 62,174 processed listings,
