@@ -901,7 +901,7 @@ def crawl_task(task: QueryTask, db_path: str) -> CrawlOutcome:
             counters["rejected"] += 1
 
     try:
-        from core.api.server import run_crawl_in_process
+        from core.crawl_runner import run_crawl_in_process
         payload = run_crawl_in_process(
             prompt=task.prompt, output_format="json", headless=True, locale="en-MY",
             max_results=task.initial_results, scroll_timeout=task.scroll_timeout,

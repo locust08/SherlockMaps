@@ -42,6 +42,20 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Fifth checkpoint: worker import isolation
+
+Moved the shared synchronous crawl function unchanged into `core/crawl_runner.py`.
+The API re-exports the same function; batch workers import the lightweight module
+directly, avoiding FastAPI, queue loading and SMTP-store initialization. Existing
+browser lifecycle, callbacks, settings, metrics and result serialization remain
+the same. Fresh-process inspection confirmed no `core.api` or `fastapi` modules
+loaded. The isolated import took 0.469 seconds on this laptop; an old-path timing
+baseline has not been measured, so no relative speed claim is made.
+
+Three additional tests verify fresh-process import isolation, settings/callbacks/
+metric propagation and browser cleanup following extraction failure. They pass,
+as do the previous 24 tests. The full live rollout remains pending.
+
 ### Fourth checkpoint: localized opening-hours fallback
 
 The fallback loop stopped on the truthy string `N/A`, preventing it from reaching
