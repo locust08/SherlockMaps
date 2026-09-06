@@ -42,6 +42,29 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Seventh checkpoint: whole-detail paired baseline and export review
+
+Added `python -m tests.live_detail_comparison`: loads the trusted pre-optimization
+extractor from git commit 684bc52, freezes a 12-location sample alternating sites
+and phone-only businesses, uses fresh contexts and alternates baseline/candidate
+order. It compares every CompanyData field including name, address, category,
+contact, ratings, hours and closure state. Results are private under ignored
+`data/detail_comparison.json`.
+
+Completed 12 pairs: baseline 41.782 seconds total, candidate 40.248 seconds,
+ratio 1.038x. All fields matched in all pairs, with no failed extractions or
+reported blocks. This small sequential sample shows only a modest difference,
+not a reliable multiplier. It excludes feed scrolling, persistence and scheduling.
+The grouped-contact experiment therefore stays disabled pending stronger evidence;
+duplicate work and scheduling remain the more promising next areas.
+
+Reviewed CompanyData, URL validation, output serialization and dashboard read/
+export paths. Found and fixed a stale CSV header that rejected V4 identity/contact
+fields; exports now retain every model field and serialize emails as JSON.
+Removed an emoji that crashed file-export confirmation on Windows cp1252 consoles.
+Fixed the CompanyData URL-validator import for repository-root invocation.
+Added CSV round-trip and URL-validation regression tests.
+
 ### Sixth checkpoint: API dispatch correctness and bounded concurrency
 
 Standalone API crawl and email callbacks now serialize their respective queues,

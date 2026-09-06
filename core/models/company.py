@@ -126,7 +126,7 @@ class CompanyData:
         Returns:
             True if the website is a valid HTTP(S) URL, False otherwise.
         """
-        from processors.url_validator import URLValidator
+        from core.processors.url_validator import URLValidator
 
         return URLValidator.is_valid(self.website)
 

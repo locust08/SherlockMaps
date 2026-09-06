@@ -100,7 +100,9 @@ class OutputHandler:
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Flatten attributes for CSV
-        fieldnames = ["name", "category", "address", "phone", "website", "rating", "reviews_count", "plus_code", "opening_hours", "attributes", "reviews"]
+        # Keep all model fields, including branch identity and contact metadata.
+        # A stale fixed header caused DictWriter to reject every V4 record.
+        fieldnames = list(companies[0].to_dict())
         with open(output_file, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -112,9 +114,11 @@ class OutputHandler:
                 # Convert reviews list to JSON string for CSV
                 if isinstance(row.get("reviews"), list):
                     row["reviews"] = json.dumps(row["reviews"], ensure_ascii=False)
+                if isinstance(row.get("emails"), list):
+                    row["emails"] = json.dumps(row["emails"], ensure_ascii=False)
                 writer.writerow(row)
 
-        print(f"📄 Results saved to: {output_file}")
+        print(f"Results saved to: {output_file}")
         print()
 
     def _output_file(self, companies: list[CompanyData]) -> None:
@@ -131,7 +135,7 @@ class OutputHandler:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-        print(f"📄 Results saved to: {output_file}")
+        print(f"Results saved to: {output_file}")
         print()
 
     def _output_pretty(self, companies: list[CompanyData]) -> None:
