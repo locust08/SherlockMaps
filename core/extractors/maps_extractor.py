@@ -82,6 +82,7 @@ class MapsExtractor:
         page_recycler: Callable[[], Page] | None = None,
         memory_cleanup_callback: Callable[[], None] | None = None,
         discovery_cleanup_interval: int = 30,
+        batched_details: bool = False,
     ) -> None:
         """Initialize the MapsExtractor.
 
@@ -107,6 +108,7 @@ class MapsExtractor:
         self.processing_limit = max_results
         self.page_recycle_count = 0
         self.memory_cleanup_count = 0
+        self._batched_details = batched_details
 
     def extract_all(self, track_reviews: bool = True) -> list[CompanyData]:
         """Extract all company data from the current Google Maps search results page.
@@ -384,21 +386,22 @@ class MapsExtractor:
                 return None
 
             # Build details dictionary
+            contacts = self._extract_contact_fields() if self._batched_details else None
             details: dict = {
                 "name": self._safe_text(self._page.locator(self.NAME_SELECTOR)),
                 "rating": self._extract_rating(),
                 "reviews_count": self._extract_reviews_count(),
                 "category": self._extract_category(),
-                "address": self._safe_text(
+                "address": contacts["address"] if contacts is not None else self._safe_text(
                     self._page.locator(self.ADDRESS_CONTAINER_SELECTOR)
                 ),
-                "website": self._safe_attribute(
+                "website": contacts["website"] if contacts is not None else self._safe_attribute(
                     self._page.locator(self.WEBSITE_SELECTOR), "href"
                 ),
-                "phone": self._safe_text(
+                "phone": contacts["phone"] if contacts is not None else self._safe_text(
                     self._page.locator(self.PHONE_CONTAINER_SELECTOR)
                 ),
-                "plus_code": self._safe_text(
+                "plus_code": contacts["plus_code"] if contacts is not None else self._safe_text(
                     self._page.locator(self.PLUS_CODE_SELECTOR)
                 ),
                 "opening_hours": self._extract_opening_hours(),
@@ -420,6 +423,34 @@ class MapsExtractor:
         except Exception as e:
             logger.warning("Error extracting company details from %s: %s", url, e)
             return None
+
+    def _extract_contact_fields(self) -> dict[str, str]:
+        """Read optional contact fields with one shared, bounded hydration wait.
+
+        Experimental until paired live comparisons establish field completeness.
+        A missing optional field costs at most two seconds for the entire group.
+        """
+        selectors = {
+            "address": self.ADDRESS_CONTAINER_SELECTOR,
+            "website": self.WEBSITE_SELECTOR,
+            "phone": self.PHONE_CONTAINER_SELECTOR,
+            "plus_code": self.PLUS_CODE_SELECTOR,
+        }
+        try:
+            self._page.wait_for_function(
+                "selectors => Object.values(selectors).every(s => document.querySelector(s))",
+                arg=selectors, timeout=2000,
+            )
+        except TimeoutError:
+            pass
+        return self._page.evaluate("""selectors => Object.fromEntries(
+            Object.entries(selectors).map(([key, selector]) => {
+                const matches = document.querySelectorAll(selector);
+                if (matches.length !== 1) return [key, 'N/A'];
+                const element = matches[0];
+                const value = key === 'website' ? element.getAttribute('href') : element.innerText.trim();
+                return [key, value || 'N/A'];
+            }))""", selectors)
 
     @staticmethod
     def extract_place_id(url: str) -> str:

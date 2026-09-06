@@ -42,6 +42,32 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Third checkpoint: experimental grouped contact extraction
+
+`MapsExtractor(batched_details=True)` reads address, website, phone and plus code
+after one shared two-second optional-field wait. Default remains false pending
+broader tests, so production extraction behavior is unchanged by this experiment.
+Run `python -m tests.benchmark_contact_fields` for offline Chromium fixtures.
+
+| Fixture | Sequential seconds | Grouped seconds | Output parity |
+| --- | ---: | ---: | --- |
+| All fields present | 0.060 | 0.039 | Exact |
+| All fields absent | 8.047 | 2.019 | Exact |
+| Fields arrive after 1.5 seconds | 1.620 | 1.527 | Exact |
+| Duplicate phone selector | 0.044 | 0.024 | Exact |
+
+`python -m tests.live_contact_canary` completed eight live listings with zero
+contact differences or blocking. Four listings had all four fields; four had
+three. The grouped path was read first and the reference path second on the same
+page; reference timing therefore is NOT an independent navigation baseline.
+This is only an early field-parity check. Listings with one absent field show
+little timing benefit. It does not prove population-level accuracy or overall
+throughput improvement. Existing 20 regression tests also pass.
+
+Late fields beyond the shared wait require further characterization. The current
+opening-hours fallbacks are German-only despite en-MY production locale; assess
+English/Malay extraction and its waits alongside grouped contact rollout.
+
 ### Second implementation checkpoint: persistence and worker setup
 
 - Worker processes now open only an existing database with `mode=rw`; startup
