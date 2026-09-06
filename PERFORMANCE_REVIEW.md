@@ -42,6 +42,25 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Second implementation checkpoint: persistence and worker setup
+
+- Worker processes now open only an existing database with `mode=rw`; startup
+  migration remains in the controller. Missing paths fail rather than creating
+  an empty database. Twenty-run median in an empty initialized fixture:
+  full setup 13.094 ms, worker connection 5.250 ms. This is a modest startup gain,
+  not an end-to-end throughput multiplier.
+- Observation writes acquire `BEGIN IMMEDIATE` before identity lookup and commit
+  atomically, including qualification, provenance and scoring. Exceptions roll
+  back the complete observation. Existing per-observation durability is retained.
+- Result callbacks execute outside the extractor's skip-on-extraction-error
+  handler. Persistence failure now aborts the query and reaches the controller's
+  existing retry policy rather than silently completing a partially saved query.
+- Processed counters advance only after persistence succeeds.
+- All 20 tests pass, including real SQLite concurrent-writer tests (eight saves,
+  one location/observation), injected scoring rollback followed by successful
+  retry, callback error propagation, and missing-worker-database rejection.
+- Deployment is still pending the broader extraction and live-canary work below.
+
 - Missing optional fields each use an independent two-second locator wait.
   A shared readiness check and batched extraction could save seconds per listing,
   but delayed field arrival must be tested before replacing those waits.

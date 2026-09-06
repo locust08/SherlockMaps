@@ -326,6 +326,14 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def worker_connection(path: Path) -> sqlite3.Connection:
+    """Open an existing initialized database without running migrations per query."""
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=60)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+    return conn
+
+
 def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=60)
@@ -836,6 +844,17 @@ def save_one_result(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, An
 
 
 def persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, Any]) -> str:
+    # Acquire the writer slot before reading identity state. This prevents two
+    # workers racing a read followed by a write and rolls back partial scoring
+    # or provenance if any part of the observation fails.
+    if conn.in_transaction:
+        raise RuntimeError("Observation persistence requires a clean transaction")
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return _persist_observation(conn, task, raw)
+
+
+def _persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, Any]) -> str:
     key_source = "|".join((task.prompt, usable(raw.get("place_id")), usable(raw.get("source_url")), usable(raw.get("name")), usable(raw.get("address"))))
     observation_key = hashlib.sha256(key_source.encode("utf-8", errors="ignore")).hexdigest()
     existing = conn.execute("SELECT rejection_reason,company_id FROM raw_observations WHERE observation_key=?", (observation_key,)).fetchone()
@@ -843,7 +862,6 @@ def persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str
         if existing[1]:
             set_company_classification(conn, int(existing[1]), task.sector, 90, "search_term")
             score_company(conn, int(existing[1]))
-            conn.commit()
         return "duplicate_observation"
     reason, company_id = save_one_result(conn, task, raw)
     conn.execute(
@@ -853,13 +871,12 @@ def persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str
          json.dumps(raw, ensure_ascii=False), int(reason in {"new", "duplicate"}),
          "" if reason in {"new", "duplicate"} else reason, company_id, utc_now()),
     )
-    conn.commit()
     return reason
 
 
 def crawl_task(task: QueryTask, db_path: str) -> CrawlOutcome:
     counters = {"processed": 0, "accepted": 0, "new": 0, "duplicate": 0, "rejected": 0}
-    conn = open_db(Path(db_path))
+    conn = worker_connection(Path(db_path))
     critical_since: float | None = None
 
     def memory_guard() -> bool:
@@ -872,8 +889,8 @@ def crawl_task(task: QueryTask, db_path: str) -> CrawlOutcome:
 
     def callback(company: Any) -> None:
         raw = company.to_dict()
-        counters["processed"] += 1
         reason = persist_observation(conn, task, raw)
+        counters["processed"] += 1
         if reason == "new":
             counters["new"] += 1
             counters["accepted"] += 1

@@ -313,18 +313,20 @@ class MapsExtractor:
                 if i and i % self._page_recycle_interval == 0:
                     self._recycle_page()
                 company = self._extract_company_details(url, i, track_reviews=track_reviews)
-                if company:
-                    companies.append(company)
-                    if self._result_callback:
-                        self._result_callback(company)
-                # Small delay between requests
-                time.sleep(0.3 + (i % 5) * 0.1)
 
             except MemoryPressureError:
                 raise
             except Exception as e:
                 logger.warning("Failed to extract company from %s: %s", url, e)
                 continue
+
+            # Persistence errors must abort the query so the controller can retry
+            # it. Swallowing them here silently marks undurable results complete.
+            if company:
+                if self._result_callback:
+                    self._result_callback(company)
+                companies.append(company)
+            time.sleep(0.3 + (i % 5) * 0.1)
 
         return companies
 
