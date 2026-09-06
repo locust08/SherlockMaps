@@ -267,16 +267,15 @@ class MapsExtractor:
         Returns:
             A list of valid place URLs.
         """
-        link_elements = parent_element.query_selector_all(self.LINK_SELECTOR)
-        links = []
-
-        for link_element in link_elements:
-            href = link_element.get_attribute("href")
-            if href and href.startswith("https://www.google.com/maps/place/"):
-                if len(href) > 40:
-                    links.append(href)
-
-        return links
+        # Read all hrefs in one browser round trip. Keep the original attribute
+        # values and filtering rules so relative and unrelated links stay excluded.
+        return parent_element.eval_on_selector_all(
+            self.LINK_SELECTOR,
+            """elements => elements.map(element => element.getAttribute('href'))
+                .filter(href => href &&
+                    href.startsWith('https://www.google.com/maps/place/') &&
+                    href.length > 40)""",
+        )
 
     @staticmethod
     def _remove_duplicate_links(links: list[str]) -> list[str]:
