@@ -42,6 +42,27 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Eighth checkpoint: measured sales-yield scheduling
+
+Read-only 24-hour analysis: 786 completed queries, 62,174 processed listings,
+35,105 duplicates (56.46%), 2,981 new locations and 3,029 attributed A/B leads.
+The last two counters demonstrate that overlapping-query attribution cannot be
+assumed to be unique. No historical counters were rewritten.
+
+Scheduling estimates now prefer measured V4 A/B yield after at least three
+completed queries for a sector/term, bounded by each query's new-location counter.
+Unknown terms retain the existing historical/sector fallback. Explicit zero
+yield is preserved instead of being replaced with an eight-lead default.
+Market allocation and industry priority bands are unchanged. Estimates rebuild
+when the manifest is built; current long-lived worker scheduling is not yet
+reloaded. Runtime reprioritization and the live rollout remain outstanding.
+
+Current data supplies 94 measured terms; one is zero-yield. Highest observed
+averages include bengkel kereta (26.52 A/B/query), klinik perubatan (23.87), and
+motorcycle workshop (20.26). These are historical, not a forecast for new areas.
+Regression coverage verifies zero preservation, overlap capping and the
+three-sample threshold. All 17 tests in `tests.test_v2` pass.
+
 ### Seventh checkpoint: whole-detail paired baseline and export review
 
 Added `python -m tests.live_detail_comparison`: loads the trusted pre-optimization

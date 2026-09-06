@@ -19,6 +19,9 @@ from batch_collect_malaysia_v2 import (
     rolling_metrics,
     worker_upscale_stable_seconds,
     TARGET,
+    observed_ab_yields,
+    yield_estimate_cache,
+    expected_ab_yield,
 )
 from core.browser.browser_manager import BrowserManager
 from core.exceptions import MemoryPressureError
@@ -29,6 +32,23 @@ from progress_dashboard import NAV_ITEMS, call_list_query, dashboard_page, navig
 
 
 class V3CollectorTests(unittest.TestCase):
+    def test_observed_sales_yield_preserves_zero_and_bounds_overlap(self) -> None:
+        tasks = [QueryTask(f"dentist fixture {i}", self.task.sector, self.task.locality,
+                           self.task.state, self.task.term, "district") for i in range(3)]
+        register_manifest(self.conn, tasks)
+        self.conn.execute("UPDATE search_jobs SET status='completed',qualified_new=0,ab_leads_new=5")
+        self.conn.commit()
+        key = (self.task.sector, self.task.term)
+        self.assertEqual(observed_ab_yields(self.conn)[key], 0)
+        self.assertEqual(yield_estimate_cache(self.conn)[key], 0)
+        self.assertEqual(expected_ab_yield(self.conn, *key), 0)
+        self.conn.execute("UPDATE search_jobs SET qualified_new=2,ab_leads_new=5")
+        self.conn.commit()
+        self.assertEqual(observed_ab_yields(self.conn)[key], 2)
+        self.conn.execute("UPDATE search_jobs SET status='pending' WHERE prompt=?", (tasks[0].prompt,))
+        self.conn.commit()
+        self.assertNotIn(key, observed_ab_yields(self.conn))
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "test.sqlite"

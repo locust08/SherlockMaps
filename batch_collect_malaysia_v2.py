@@ -554,6 +554,9 @@ def strategy_for(sector: str, term: str, geo_level: str = "city") -> tuple[str, 
 def expected_ab_yield(conn: sqlite3.Connection | None, sector: str, term: str) -> float:
     if conn is None:
         return 4.0
+    observed = observed_ab_yields(conn).get((sector, term))
+    if observed is not None:
+        return observed
     row = conn.execute(
         """SELECT AVG(qualified_new) FROM search_jobs
            WHERE status='completed' AND sector=? AND term=?""",
@@ -564,8 +567,25 @@ def expected_ab_yield(conn: sqlite3.Connection | None, sector: str, term: str) -
             "SELECT AVG(qualified_new) FROM search_jobs WHERE status='completed' AND sector=?",
             (sector,),
         ).fetchone()
-    raw_yield = float(row[0] or 8.0)
+    raw_yield = float(row[0]) if row and row[0] is not None else 8.0
     return round(raw_yield * sector_ab_fraction(conn, sector), 2)
+
+
+def observed_ab_yields(conn: sqlite3.Connection) -> dict[tuple[str, str], float]:
+    """Use measured V4 sales yield once a term has three completed samples.
+
+    Concurrent overlapping prompts can attribute the same new lead twice.
+    Bound A/B credit by each query's own new-location counter for scheduling.
+    Historical counters and provenance remain untouched.
+    """
+    return {
+        (str(sector), str(term)): round(float(average), 2)
+        for sector, term, average in conn.execute(
+            """SELECT sector,term,AVG(MAX(0,MIN(COALESCE(ab_leads_new,0),qualified_new)))
+               FROM search_jobs WHERE taxonomy_version=4 AND status='completed'
+               GROUP BY sector,term HAVING COUNT(*)>=3"""
+        )
+    }
 
 
 def yield_estimate_cache(conn: sqlite3.Connection | None) -> dict[tuple[str, str], float]:
@@ -604,6 +624,7 @@ def yield_estimate_cache(conn: sqlite3.Connection | None) -> dict[tuple[str, str
         for term in set(terms + V4_EXTRA_TERMS.get(sector, [])):
             raw = term_yields.get((sector, term), sector_yields.get(sector, 8.0))
             cache[(sector, term)] = round(raw * fraction, 2)
+    cache.update(observed_ab_yields(conn))
     return cache
 
 
