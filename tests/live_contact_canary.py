@@ -37,10 +37,14 @@ def main():
                 measured = time.monotonic()
                 reference = legacy(extractor)
                 reference_seconds = time.monotonic() - measured
+                measured = time.monotonic()
+                hours = extractor._extract_opening_hours()
+                hours_seconds = time.monotonic() - measured
                 differences = [key for key in fast if fast[key] != reference[key]]
                 print(json.dumps({"index": index, "fast_seconds": round(fast_seconds, 3),
                     "reference_seconds_after_fast": round(reference_seconds, 3),
                     "differences": differences, "present_fields": sum(v != "N/A" for v in reference.values()),
+                    "opening_hours": hours, "hours_seconds": round(hours_seconds, 3),
                     "total_seconds": round(time.monotonic() - started, 3)}), flush=True)
             except Exception as exc:
                 print(json.dumps({"index": index, "error": str(exc)}), flush=True)

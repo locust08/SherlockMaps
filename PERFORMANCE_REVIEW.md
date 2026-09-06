@@ -42,6 +42,26 @@ this first change; long-lived workers may still hold the original implementation
 
 ## Findings requiring further implementation/verification
 
+### Fourth checkpoint: localized opening-hours fallback
+
+The fallback loop stopped on the truthy string `N/A`, preventing it from reaching
+other selectors. Replaced it with a shared two-second locator wait for English,
+Malay and German hours labels, retaining the main-container preference. Patterns
+avoid treating a business name such as `Open Studio Design` as opening hours.
+Real Chromium tests cover eight localized labels, a delayed label, absent hours,
+and main-container precedence. All 24 regression tests pass.
+
+A second eight-listing live diagnostic completed without blocks or contact-field
+differences. Five returned opening hours in 0–31 ms; three returned `N/A` after
+the bounded two-second wait. This did not compare old versus new hours on the
+same document and is not a population-level accuracy or speed measurement.
+
+Additional review finding: batch workers import `core.api.server`, which creates
+queue and email-store globals at import time. Investigate separating the shared
+crawl runner from the web application so collection need not load API state.
+The standalone API also still dequeues a job independently of its supplied job
+ID; its concurrency and cancellation behavior need review before final acceptance.
+
 ### Third checkpoint: experimental grouped contact extraction
 
 `MapsExtractor(batched_details=True)` reads address, website, phone and plus code

@@ -544,16 +544,18 @@ class MapsExtractor:
 
         # Fallback selectors
         if not hours_text or hours_text == "N/A":
-            fallback_selectors = [
-                'div.fontBodyMedium span[class*=""]:has-text("Öffnet")',
-                'div.fontBodyMedium span[class*=""]:has-text("Geschlossen")',
-                'div.fontBodyMedium span[class*=""]:has-text("Rund um die Uhr geöffnet")',
-            ]
-            for selector in fallback_selectors:
-                extracted = self._safe_text(self._page.locator(selector).first)
-                if extracted:
-                    hours_text = extracted
-                    break
+            # One wait for all supported labels. Previously the truthy "N/A"
+            # default stopped the loop at its first German-only selector, hiding
+            # both later German alternatives and the en-MY production labels.
+            hours_label = (
+                r"^(?:Öffnet|Geschlossen|Rund um die Uhr geöffnet|"
+                r"(?:Open|Closed|Buka|Tutup|Ditutup)(?:$|\\s*[·⋅]|\\s+24\\s)|"
+                r"(?:Opens|Closes|Dibuka)(?:\\s+at)?\\s+\\d)"
+            )
+            fallback = self._page.locator(
+                f'div.fontBodyMedium span:text-matches("{hours_label}", "i")'
+            ).first
+            hours_text = self._safe_text(fallback)
 
         if hours_text and hours_text != "N/A":
             hours_text = hours_text.replace("\n", " ").strip()
