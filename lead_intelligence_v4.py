@@ -175,6 +175,8 @@ def setup_v4_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS ix_lead_intelligence_score
             ON lead_intelligence(intelligence_version,sales_readiness_score DESC,company_id);
         CREATE INDEX IF NOT EXISTS ix_company_organization_org ON company_organization(organization_id);
+        CREATE INDEX IF NOT EXISTS ix_lead_intelligence_org_score
+            ON lead_intelligence(organization_id,intelligence_version,sales_readiness_score DESC,company_id);
         CREATE INDEX IF NOT EXISTS ix_sales_leads_status_pic ON sales_leads(status,assigned_pic);
         CREATE INDEX IF NOT EXISTS ix_sales_activities_org ON sales_activities(organization_id,created_at DESC);
         CREATE INDEX IF NOT EXISTS ix_companies_last_seen_v4 ON companies(last_seen_at DESC,id);

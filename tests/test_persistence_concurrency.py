@@ -71,6 +71,37 @@ class PersistenceTests(unittest.TestCase):
             finally:
                 other.close()
 
+    def test_enrichment_does_not_hold_writer_during_http_audit(self):
+        import website_enrichment
+        raw = dict(self.raw, website="https://fixture.example")
+        persist_observation(self.conn, self.task, raw)
+
+        def audit_without_network(company_id, website):
+            other = worker_connection(self.path)
+            other.execute("PRAGMA busy_timeout=100")
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.rollback()
+            finally:
+                other.close()
+            return website_enrichment.AuditResult(company_id=company_id)
+
+        with patch.object(website_enrichment, "DB_PATH", self.path), patch.object(
+            website_enrichment, "audit", side_effect=audit_without_network
+        ), patch.object(website_enrichment, "save_result"):
+            self.assertEqual(website_enrichment.run(limit=1), 1)
+
+    def test_representative_lookup_uses_organization_index_without_changing_result(self):
+        persist_observation(self.conn, self.task, self.raw)
+        org = self.conn.execute("SELECT organization_id FROM lead_intelligence LIMIT 1").fetchone()[0]
+        query = ("SELECT company_id FROM lead_intelligence WHERE organization_id=? "
+                 "AND intelligence_version=? ORDER BY sales_readiness_score DESC,company_id LIMIT 1")
+        expected = self.conn.execute(query.replace("FROM lead_intelligence", "FROM lead_intelligence NOT INDEXED"), (org, 4)).fetchall()
+        actual = self.conn.execute(query, (org, 4)).fetchall()
+        self.assertEqual(actual, expected)
+        plan = self.conn.execute("EXPLAIN QUERY PLAN " + query, (org, 4)).fetchall()
+        self.assertIn("ix_lead_intelligence_org_score", " ".join(str(row[3]) for row in plan))
+
     def test_callback_failure_aborts_remaining_links(self):
         def fail(_):
             raise sqlite3.OperationalError("database is locked")

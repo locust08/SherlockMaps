@@ -2,6 +2,20 @@
 
 ## September 11: controller write-lock regression
 
+Organization representative lookup used only the global intelligence-version /
+score index, filtering organizations while scanning ranked rows. A live read-only
+lookup took 0.886 seconds. Added a covering index on organization ID, intelligence
+version, descending score and company ID. In a 211,000-row in-memory fixture,
+four lookups over five repetitions had median 0.288043 seconds before and
+0.0000155 seconds after, with identical selected IDs. This is a query-level
+microbenchmark, not an end-to-end crawl multiplier. The automated test confirms
+the query plan uses the new index and agrees with an unindexed lookup.
+
+Removed the enrichment runner's duplicate schema initialization: `open_db`
+already initializes and commits it. The second call opened a metadata write
+transaction before network audits. A real SQLite test now verifies another
+connection can acquire the writer slot while the audit runs, without networking.
+
 The optional email crawler owned only its context, leaving the separately
 launched browser and Playwright driver unclosed. It now tracks and releases all
 three resources, including failed initialization. Three async lifecycle tests

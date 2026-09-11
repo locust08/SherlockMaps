@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from batch_collect_malaysia_v2 import DB_PATH, open_db, utc_now
-from lead_intelligence_v4 import score_company, setup_v4_schema
+from lead_intelligence_v4 import score_company
 
 MAX_BYTES = 1_000_000
 TIMEOUT_SECONDS = 10
@@ -192,7 +192,8 @@ def save_result(conn: sqlite3.Connection, result: AuditResult) -> None:
 
 def run(limit: int = 500) -> int:
     conn = open_db(Path(DB_PATH))
-    setup_v4_schema(conn)
+    # open_db already initializes and commits the schema. Repeating setup here
+    # opens a metadata write transaction that would span the network requests.
     rows = conn.execute(
         """SELECT c.id,c.website FROM companies c
            LEFT JOIN website_intelligence wi ON wi.company_id=c.id
