@@ -2,6 +2,14 @@
 
 ## September 11: controller write-lock regression
 
+Rollout at 18:11 MYT: created a SQLite backup containing 211,332 companies
+(`data/backups/before-optimization-20260911T101045159230Z.sqlite`, quick_check
+`ok`, 2,976,534,528 bytes). Temporarily disabled the watchdog and terminated
+only the verified collector tree rooted at PID 15420. Re-enabled the watchdog
+and resumed through its existing script. New controller PID 13036 started at
+18:11:30 and submitted queries at 18:11:43, scaling to two workers at 18:11:53.
+All 38 tests pass. Sustained post-rollout performance is still unmeasured.
+
 The memory policy also bypassed its existing 2 GB launch threshold when scaling
 from one to four workers. Production events showed repeated launches at 1.06–1.07
 GB followed by immediate downscales below 0.65 GB and reclaimed work. The same
