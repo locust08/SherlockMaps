@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class DeduplicationProcessor:
-    """Removes duplicate companies from a list based on name and website.
+    """Removes duplicate physical listings while preserving separate branches.
 
-    This processor uses a combination of company name and website URL
-    as the unique identifier to detect duplicates.
+    Prefer a Maps place ID. Without one, require name, physical address and
+    website to agree; a shared brand website alone is not a location identity.
 
     Usage:
         processor = DeduplicationProcessor()
@@ -25,8 +25,7 @@ class DeduplicationProcessor:
     def process(self, companies: list["CompanyData"]) -> list["CompanyData"]:
         """Remove duplicate companies from the list.
 
-        Companies are considered duplicates if they have the same
-        name AND website combination.
+        Prefer explicit location IDs; preserve ambiguous address-less records.
 
         Args:
             companies: A list of CompanyData objects.
@@ -38,10 +37,19 @@ class DeduplicationProcessor:
             return []
 
         unique_companies: list[CompanyData] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, ...]] = set()
 
         for company in companies:
-            key = (company.name.strip().lower(), company.website.strip().lower())
+            place_id = (company.place_id or "").strip()
+            if place_id and place_id.casefold() != "n/a":
+                key = ("place", place_id)
+            else:
+                name = " ".join((company.name or "").casefold().split())
+                address = " ".join((company.address or "").casefold().split())
+                if not name or name == "n/a" or not address or address == "n/a":
+                    unique_companies.append(company)
+                    continue
+                key = ("address", name, address, (company.website or "").strip().lower())
 
             if key not in seen:
                 seen.add(key)

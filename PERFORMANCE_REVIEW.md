@@ -1,5 +1,68 @@
 # Crawling performance review — in progress
 
+## Consolidated verification (11 September 2026)
+
+The performance review covered the collector/scheduler and SQLite persistence,
+Maps browser/extractor lifecycle, result models and processors, website/email
+enrichment, standalone API queues, dashboard/export handlers, UI polling/build,
+launchers and watchdog. Generated browser-profile binaries are not application
+source. No SMTP sends, outreach, VPN/proxy changes or CAPTCHA bypasses were used.
+
+Implemented improvements:
+
+- Batch feed-link reads instead of one browser round trip per anchor.
+- Lightweight worker imports/connections and atomic per-listing persistence.
+- Correct opening-hours fallback and retry of unconfirmed feed failures.
+- Release controller checkpoint and enrichment startup write locks promptly.
+- Cover organization representative lookup with an organization/score index.
+- Apply existing RAM launch headroom consistently; enforce cooldown submission
+  pauses without weakening repeated-block halting.
+- Release optional email browser/driver resources and serialize standalone API
+  queue dispatch with correct job identity/cancellation handling.
+- Preserve physical branches in standalone result deduplication using Place ID
+  or name/address/site, rather than merging a shared name/site across branches.
+- Stream dashboard XLSX exports with per-request temporary files; fix CSV model
+  field/header consistency and retain isolated, bounded-memory export behavior.
+- Use observed, bounded A/B query-yield estimates while retaining geography
+  priorities and existing query history.
+
+Validation includes real SQLite competing-writer/rollback tests; browser DOM
+fixtures; full-field paired live detail checks (12 pairs, no field differences);
+export XML parity and concurrent-download cleanup; resource lifecycle and
+scheduler boundaries; and a successful Next.js production build including type
+checks. Grouped contact-field extraction remains OFF: the paired live sample
+showed only about 1.04x improvement, too little to justify enabling it broadly.
+
+Live equal-window observation after the 18:11:30 MYT restart, sampled at about
+18:24:56 (13.44 minutes each):
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Completed queries | 1 | 12 |
+| Processed listings in completed queries | 117 | 627 |
+| New qualified locations attributed to completed queries | 40 | 52 |
+
+Thus processed volume was 5.36x and qualified yield 1.30x in these short windows.
+This is NOT a controlled benchmark or a sustained multiplier: query/category
+mixes differ, jobs straddle boundaries, and the post window includes ramp-up.
+There were no completed-query errors after restart and no memory reclaims in
+the observed session. All 55 newly stored locations at sampling had the required
+name/address/contact fields; that structural check is not an independent manual
+category audit. The live organization lookup now uses the covering index and a
+sample took 0.0000785 seconds versus 0.886 seconds before (different organizations,
+so rely on the identical-fixture benchmark below for controlled comparison).
+
+Remaining operational limitations: Google supply and duplicate rate dominate
+qualified-lead yield; no guaranteed overall multiplier is claimed. Historical
+A/B attribution may exceed the new count, so scheduling estimates are bounded.
+The API JSON job store and optional legacy snapshot exporter still retain their
+history in memory; production Malaysia crawling uses SQLite, not those stores.
+The newest dashboard code becomes active on its next restart. The localhost UI
+is intended for trusted local use, not unauthenticated public hosting.
+
+The checkpoint narrative below records intermediate states; statements such as
+"deployment pending" there describe those earlier checkpoints, not all changes.
+
 ## September 11: controller write-lock regression
 
 Dashboard XLSX generation now streams rows into a disk-backed ZIP instead of
