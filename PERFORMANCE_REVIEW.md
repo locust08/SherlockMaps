@@ -2,6 +2,17 @@
 
 ## September 11: controller write-lock regression
 
+Dashboard XLSX generation now streams rows into a disk-backed ZIP instead of
+building the entire worksheet in StringIO and then a second UTF-8 bytes copy.
+Concurrent downloads use separate temporary files, cleaned up on disconnect.
+The former `company_export_xlsx()` bytes-return API remains available, but HTTP
+downloads use its disk destination option. All exported XML members match the
+previous exporter on Unicode/escaped text/phone/blank/literal-formula fixtures.
+In a 10,000-row, 26-column synthetic export, tracemalloc peak Python allocation
+fell from 70.484 MB to 0.355 MB; elapsed time was 6.580 versus 6.562 seconds.
+This measures Python allocation in the export, not total process RAM or crawl
+throughput. Existing saved exports are untouched; new downloads are temporary.
+
 Organization representative lookup used only the global intelligence-version /
 score index, filtering organizations while scanning ranked rows. A live read-only
 lookup took 0.886 seconds. Added a covering index on organization ID, intelligence

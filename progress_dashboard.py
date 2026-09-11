@@ -8,6 +8,7 @@ import io
 import json
 import sqlite3
 import threading
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -170,24 +171,8 @@ def xlsx_column(index: int) -> str:
     return result
 
 
-def company_export_xlsx() -> bytes:
+def company_export_xlsx(destination: Path | None = None) -> bytes | None:
     # Build a standards-compliant XLSX using only the Python standard library.
-    rows = io.StringIO()
-    rows.write('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
-    headers = [label for label, _ in COMPANY_EXPORT_COLUMNS]
-    rows.write('<row r="1">')
-    for index, value in enumerate(headers, 1):
-        rows.write(xlsx_cell(value, f"{xlsx_column(index)}1"))
-    rows.write('</row>')
-    conn = connection()
-    for row_number, row in enumerate(conn.execute(company_export_query()), 2):
-        rows.write(f'<row r="{row_number}">')
-        for index, value in enumerate(row, 1):
-            rows.write(xlsx_cell(value, f"{xlsx_column(index)}{row_number}"))
-        rows.write('</row>')
-    conn.close()
-    rows.write('</sheetData></worksheet>')
-    worksheet = rows.getvalue().encode("utf-8")
     content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -201,14 +186,29 @@ def company_export_xlsx() -> bytes:
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'''
     workbook_relationships = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'''
-    output = io.BytesIO()
+    output = destination if destination is not None else io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", relationships)
         archive.writestr("xl/workbook.xml", workbook)
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_relationships)
-        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
-    return output.getvalue()
+        # Keep only one row in Python memory, including for disk-backed exports.
+        with archive.open("xl/worksheets/sheet1.xml", "w", force_zip64=True) as sheet:
+            sheet.write(b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+            headers = [label for label, _ in COMPANY_EXPORT_COLUMNS]
+            def write_row(number: int, values) -> None:
+                cells = "".join(xlsx_cell(value, f"{xlsx_column(index)}{number}")
+                                for index, value in enumerate(values, 1))
+                sheet.write(f'<row r="{number}">{cells}</row>'.encode("utf-8"))
+            write_row(1, headers)
+            conn = connection()
+            try:
+                for number, row in enumerate(conn.execute(company_export_query()), 2):
+                    write_row(number, row)
+            finally:
+                conn.close()
+            sheet.write(b'</sheetData></worksheet>')
+    return output.getvalue() if isinstance(output, io.BytesIO) else None
 
 
 def report_page(data: dict) -> str:
@@ -814,14 +814,19 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/export/call-list.csv":
                 stream_call_list_csv(self)
             elif parsed.path == "/export/companies.xlsx":
-                export_path = DB_PATH.parent / "sherlockmaps-companies.xlsx"
-                export_path.write_bytes(company_export_xlsx())
-                self.download_file(export_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "sherlockmaps-companies.xlsx")
+                # Each request owns its file: concurrent downloads cannot truncate
+                # one another, and disconnects still remove the temporary export.
+                with tempfile.TemporaryDirectory(prefix="sherlockmaps-export-") as folder:
+                    export_path = Path(folder) / "sherlockmaps-companies.xlsx"
+                    company_export_xlsx(export_path)
+                    self.download_file(export_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "sherlockmaps-companies.xlsx")
             elif parsed.path == "/export/report.html":
                 report = report_page(dashboard_data()).encode("utf-8")
                 self.download(report, "text/html; charset=utf-8", "sherlockmaps-report.html", inline=True)
             else:
                 self.send_error(404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
         except Exception as exc:
             self.send_error(500, str(exc))
 
