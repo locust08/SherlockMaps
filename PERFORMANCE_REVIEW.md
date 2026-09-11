@@ -1,6 +1,17 @@
-# Crawling performance review — in progress
+# Crawling performance review
 
 ## Consolidated verification (11 September 2026)
+
+Status: code review, optimization, regression verification and rollout completed.
+All **51 automated tests pass**; Next.js production build/type checks pass.
+Final service rollout at 18:27 MYT loaded the remaining cooldown, branch-dedupe
+and export changes. Controller PID 17352 resumed the existing queue; dashboard
+PID 12544 serves the new export code. All six dashboard routes returned HTTP
+200 (Search Queries required one retry after an aborted connection). New
+observations were persisted at 18:28:38 MYT, with four active workers, 2.9 GB
+free RAM and no memory reclaims in the new session. Watchdog remains enabled.
+The intentional process-tree shutdown logged one BrokenProcessPool error in
+the old controller before it exited; it is not a post-restart failure.
 
 The performance review covered the collector/scheduler and SQLite persistence,
 Maps browser/extractor lifecycle, result models and processors, website/email
@@ -57,7 +68,7 @@ qualified-lead yield; no guaranteed overall multiplier is claimed. Historical
 A/B attribution may exceed the new count, so scheduling estimates are bounded.
 The API JSON job store and optional legacy snapshot exporter still retain their
 history in memory; production Malaysia crawling uses SQLite, not those stores.
-The newest dashboard code becomes active on its next restart. The localhost UI
+The newest dashboard code is active following the final restart. The localhost UI
 is intended for trusted local use, not unauthenticated public hosting.
 
 The checkpoint narrative below records intermediate states; statements such as
@@ -132,12 +143,13 @@ test checks both first-time and repeated checkpoints and acquisition of the
 writer slot from a separate connection. Live rollout/throughput verification
 remains required; this is not yet a measured end-to-end speed improvement.
 
-## Scope and baseline
+## Scope and baseline (historical kickoff)
 
 Requested: review the full codebase, research methodology, improve throughput on
 the existing laptop, preserve consistency and accuracy, test, commit and push.
-The review and rollout are not complete. Do not interpret the microbenchmark as
-an end-to-end crawling speed claim.
+At this initial checkpoint, review and rollout were incomplete. Do not interpret
+any microbenchmark as an end-to-end crawling speed claim; use the consolidated
+verification above for the final state.
 
 Live status observed 6 September 2026: 206,009 qualified locations, 32.96 queries
 per hour over 24 hours, 126.08 new qualified locations per hour, six active

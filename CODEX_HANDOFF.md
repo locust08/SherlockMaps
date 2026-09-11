@@ -12,6 +12,21 @@ The completion target is **400,000 qualified unique physical locations**, not ra
 
 Always read live counts from `data/malaysia_batch_status.json` or [http://localhost:8765/](http://localhost:8765/); counts in messages or documents become stale.
 
+## Performance maintenance
+
+Read `PERFORMANCE_REVIEW.md` for the September 2026 optimization results, test
+evidence and limitations. Run `.venv\Scripts\python.exe -m unittest discover -s tests -q`
+before changing extraction, scheduling, persistence or export behavior.
+Keep per-listing transactions short: checkpoint/status work must not retain a
+SQLite writer lock while waiting for browsers or HTTP requests. Preserve the
+organization-score covering index and RAM launch threshold. Do not enable the
+experimental grouped contact extraction by default; its measured live gain
+was small. Excel downloads now stream through request-specific temporary files,
+which are removed after download; prior saved exports remain untouched.
+Live before/after numbers are short-window observations, not a guaranteed speed
+multiplier. Preserve Google cooldown/halting, branch identity, and immediate
+per-listing persistence when tuning further.
+
 ## Ideal customer and search direction
 
 Priority order:
