@@ -2,6 +2,13 @@
 
 ## September 11: controller write-lock regression
 
+The optional email crawler owned only its context, leaving the separately
+launched browser and Playwright driver unclosed. It now tracks and releases all
+three resources, including failed initialization. Three async lifecycle tests
+cover repeated close, a disconnected context, failed context creation and the
+persistent-context path. This is a resource-lifecycle improvement for optional
+email jobs, not a measured speed improvement for the Malaysia batch collector.
+
 Follow-up scheduler review: cooldown previously reduced the permitted worker
 count to one but left the submission loop open. New submissions now require
 the cooldown deadline to have elapsed as well as sufficient RAM. Boundary tests

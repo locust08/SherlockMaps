@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional, Set
 from urllib.parse import urljoin, urlparse
 
-from playwright.async_api import Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, Playwright
 
 from core.models import EmailData
 
@@ -97,10 +97,16 @@ class EmailExtractor:
         self._visited_urls: Set[str] = set()
         self._pending_links: list[str] = []
         self._browser_context: Optional[BrowserContext] = None
+        self._browser: Optional[Browser] = None
+        self._playwright: Optional[Playwright] = None
 
     async def __aenter__(self) -> "EmailExtractor":
         """Async context manager entry."""
-        await self._initialize_browser()
+        try:
+            await self._initialize_browser()
+        except BaseException:
+            await self.close()
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -111,7 +117,8 @@ class EmailExtractor:
         """Initialize the Playwright browser with Chrome profile."""
         from playwright.async_api import async_playwright
 
-        playwright = await async_playwright().start()
+        self._playwright = await async_playwright().start()
+        playwright = self._playwright
 
         # Launch browser with existing Chrome profile
         if self.config.chrome_profile_path:
@@ -125,23 +132,31 @@ class EmailExtractor:
                 bypass_csp=True,
             )
         else:
-            browser = await playwright.chromium.launch(
+            self._browser = await playwright.chromium.launch(
                 headless=self.config.headless,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                 ],
             )
-            self._browser_context = await browser.new_context()
+            self._browser_context = await self._browser.new_context()
 
         logger.info("Browser initialized (headless=%s, profile=%s)",
                      self.config.headless, self.config.chrome_profile_path)
 
     async def close(self) -> None:
         """Close the browser and clean up resources."""
-        if self._browser_context:
-            await self._browser_context.close()
-            self._browser_context = None
+        # Closing a non-persistent context does not close its browser or the
+        # Playwright driver. Release all three, including partial initialization.
+        resources = ((self._browser_context, "close"), (self._browser, "close"),
+                     (self._playwright, "stop"))
+        self._browser_context = self._browser = self._playwright = None
+        for resource, method in resources:
+            if resource is not None:
+                try:
+                    await getattr(resource, method)()
+                except Exception:
+                    logger.warning("Email browser cleanup failed: %s", method, exc_info=True)
         logger.info("Browser closed")
 
     def _normalize_url(self, url: str) -> str:
