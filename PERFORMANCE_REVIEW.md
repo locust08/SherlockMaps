@@ -2,6 +2,12 @@
 
 ## September 11: controller write-lock regression
 
+Follow-up scheduler review: cooldown previously reduced the permitted worker
+count to one but left the submission loop open. New submissions now require
+the cooldown deadline to have elapsed as well as sufficient RAM. Boundary tests
+cover before/at the deadline and the critical-RAM threshold. Existing active
+queries are not forcibly killed, and repeated-block halting is unchanged.
+
 Rollout at 18:11 MYT: created a SQLite backup containing 211,332 companies
 (`data/backups/before-optimization-20260911T101045159230Z.sqlite`, quick_check
 `ok`, 2,976,534,528 bytes). Temporarily disabled the watchdog and terminated

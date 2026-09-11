@@ -1002,6 +1002,11 @@ def worker_upscale_stable_seconds(next_worker_count: int) -> int:
     return RAM_BASE_UPSCALE_STABLE_SECONDS
 
 
+def submission_allowed(available_ram: float, now: float, cooldown_until: float) -> bool:
+    """Do not turn a recovery pause into continuous single-worker submissions."""
+    return available_ram >= RAM_CRITICAL_GB and now >= cooldown_until
+
+
 def ram_operating_state(available_ram: float) -> str:
     if available_ram < RAM_CRITICAL_GB:
         return "critical"
@@ -1278,7 +1283,7 @@ def run_batch(args: argparse.Namespace) -> int:
                 upscale_candidate_since = None
 
             while (pending and len(active) < effective_limit and count < args.target
-                   and ram >= RAM_CRITICAL_GB):
+                   and submission_allowed(ram, time.time(), cooldown_until)):
                 task = pending.popleft()
                 row = conn.execute(
                     "SELECT status,attempts FROM search_jobs WHERE taxonomy_version=? AND prompt=?",

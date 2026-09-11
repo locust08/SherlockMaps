@@ -18,6 +18,7 @@ from batch_collect_malaysia_v2 import (
     register_manifest,
     rolling_metrics,
     worker_upscale_stable_seconds,
+    submission_allowed,
     TARGET,
     observed_ab_yields,
     yield_estimate_cache,
@@ -153,6 +154,13 @@ class V3CollectorTests(unittest.TestCase):
         self.assertEqual(worker_upscale_stable_seconds(4), 10)
         self.assertEqual(worker_upscale_stable_seconds(5), 60)
         self.assertEqual(worker_upscale_stable_seconds(6), 300)
+
+    def test_cooldown_blocks_new_queries_even_with_free_memory(self) -> None:
+        self.assertFalse(submission_allowed(8.0, 100.0, 1000.0))
+        self.assertFalse(submission_allowed(8.0, 999.99, 1000.0))
+        self.assertTrue(submission_allowed(8.0, 1000.0, 1000.0))
+        self.assertFalse(submission_allowed(0.64, 1001.0, 1000.0))
+        self.assertTrue(submission_allowed(0.65, 1001.0, 1000.0))
 
     def test_lightweight_browser_config(self) -> None:
         config = CrawlerConfig(headless=True)
