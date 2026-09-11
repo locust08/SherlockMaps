@@ -150,6 +150,10 @@ class MapsExtractor:
         """
         parent_element = self._wait_for_feed()
         if not parent_element:
+            if self._is_direct_place():
+                self.links_discovered = 1
+                self.processing_limit = 1
+                return [self._page.url]
             return []
 
         links = self._scroll_through_results(parent_element)
@@ -160,20 +164,33 @@ class MapsExtractor:
         """Wait for the results feed to appear.
 
         Returns:
-            The feed element or None if timeout.
+            The feed element, or None for a confirmed direct-place/empty result.
         """
         try:
             return self._page.wait_for_selector(
                 self.FEED_SELECTOR,
                 timeout=25000,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
             self._raise_if_blocked()
-            logger.warning("Timeout waiting for feed selector")
-            return None
+            if self._is_direct_place() or self._has_explicit_empty_results():
+                return None
+            raise ExtractionError("FEED_TIMEOUT: result feed did not load", cause=exc) from exc
         except Exception as e:
-            logger.warning("Error waiting for feed: %s", e)
-            return None
+            raise ExtractionError("FEED_ERROR: unable to read result feed", cause=e) from e
+
+    def _is_direct_place(self) -> bool:
+        """A search may navigate directly to one business rather than a feed."""
+        return (self._page.url.startswith("https://www.google.com/maps/place/")
+                and self._page.locator(self.NAME_SELECTOR).count() > 0)
+
+    def _has_explicit_empty_results(self) -> bool:
+        # Require an explicit visible message. A timeout, blank page or selector
+        # change is not evidence of zero businesses and must reach query retry.
+        for message in ("No results found", "Tiada hasil ditemui", "Keine Ergebnisse gefunden"):
+            if self._page.get_by_text(message, exact=True).first.is_visible():
+                return True
+        return False
 
     def _scroll_through_results(self, parent_element) -> list[str]:
         """Scroll the feed and retain links continuously up to the hard cap."""
