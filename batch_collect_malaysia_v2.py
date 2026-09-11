@@ -981,7 +981,10 @@ def desired_worker_count(
     preferred = max(1, min(preferred, maximum, MAXIMUM_WORKERS))
     maximum = max(preferred, min(maximum, MAXIMUM_WORKERS))
     if current_limit < min(preferred, BASE_WORKERS):
-        return min(preferred, BASE_WORKERS)
+        # Base workers consume RAM too. Previously this bypassed the launch
+        # threshold and oscillated between launch and reclaim near 1 GB free.
+        return (min(preferred, BASE_WORKERS)
+                if available_ram >= RAM_LAUNCH_THRESHOLD_GB else current_limit)
     if current_limit < preferred:
         return preferred if available_ram >= RAM_LAUNCH_THRESHOLD_GB else current_limit
     if (current_limit == preferred and maximum > preferred

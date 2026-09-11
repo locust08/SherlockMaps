@@ -133,6 +133,10 @@ class V3CollectorTests(unittest.TestCase):
 
     def test_ram_worker_headroom(self) -> None:
         self.assertEqual(desired_worker_count(4.0, current_limit=1), 4)
+        for current_limit in (1, 2, 3):
+            for free_ram in (1.0, 1.07, 1.99):
+                self.assertEqual(desired_worker_count(free_ram, current_limit=current_limit), current_limit)
+            self.assertEqual(desired_worker_count(2.0, current_limit=current_limit), 4)
         self.assertEqual(desired_worker_count(2.0, current_limit=4), 5)
         self.assertEqual(desired_worker_count(1.99, current_limit=4), 4)
         self.assertEqual(desired_worker_count(2.0, current_limit=5), 5)

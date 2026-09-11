@@ -2,6 +2,14 @@
 
 ## September 11: controller write-lock regression
 
+The memory policy also bypassed its existing 2 GB launch threshold when scaling
+from one to four workers. Production events showed repeated launches at 1.06–1.07
+GB followed by immediate downscales below 0.65 GB and reclaimed work. The same
+launch threshold now applies to base workers; the 1 GB reserve, six-worker cap,
+upscale stability timers and Google-block controls remain unchanged. Boundary
+tests cover all three base upscale transitions. This prevents the observed
+low-headroom launch condition without forcing healthy running browsers closed.
+
 The controller's `record_checkpoints` issued `INSERT OR IGNORE` after the
 query-completion commit but never committed its own transaction. This includes
 already-recorded checkpoints. It could retain SQLite's writer slot while waiting
