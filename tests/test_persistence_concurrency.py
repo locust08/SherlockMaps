@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from batch_collect_malaysia_v2 import QueryTask, open_db, persist_observation, worker_connection
+from batch_collect_malaysia_v2 import QueryTask, open_db, persist_observation, worker_connection, record_checkpoints
 from core.extractors.maps_extractor import MapsExtractor
 from core.models import CompanyData
 
@@ -55,6 +55,21 @@ class PersistenceTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             worker_connection(missing)
         self.assertFalse(missing.exists())
+
+    def test_checkpoints_release_writer_before_controller_waits(self):
+        # Even INSERT OR IGNORE of an existing checkpoint acquires a write
+        # transaction. A controller must not retain it while awaiting workers.
+        for _ in range(2):
+            record_checkpoints(self.conn, 211000, 400000)
+            self.assertFalse(self.conn.in_transaction)
+            other = worker_connection(self.path)
+            other.execute("PRAGMA busy_timeout=100")
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.rollback()
+                self.assertEqual(other.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0], 6)
+            finally:
+                other.close()
 
     def test_callback_failure_aborts_remaining_links(self):
         def fail(_):

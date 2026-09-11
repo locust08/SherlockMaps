@@ -1018,9 +1018,13 @@ def record_event(conn: sqlite3.Connection, event_type: str, details: str, worker
 
 
 def record_checkpoints(conn: sqlite3.Connection, count: int, target: int) -> None:
-    for threshold in (10_000, 25_000, 50_000, 100_000, 150_000, 200_000, 300_000, target):
-        if count >= threshold:
-            conn.execute("INSERT OR IGNORE INTO checkpoints(name,qualified_count,reached_at) VALUES(?,?,?)", (str(threshold), count, utc_now()))
+    # The controller waits for browser workers immediately after status updates.
+    # Even an ignored INSERT holds SQLite's single writer slot until committed;
+    # never carry that lock into the wait for those workers to persist results.
+    with conn:
+        for threshold in (10_000, 25_000, 50_000, 100_000, 150_000, 200_000, 300_000, target):
+            if count >= threshold:
+                conn.execute("INSERT OR IGNORE INTO checkpoints(name,qualified_count,reached_at) VALUES(?,?,?)", (str(threshold), count, utc_now()))
 
 
 def rolling_metrics(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:

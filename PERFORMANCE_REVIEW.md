@@ -1,5 +1,20 @@
 # Crawling performance review — in progress
 
+## September 11: controller write-lock regression
+
+The controller's `record_checkpoints` issued `INSERT OR IGNORE` after the
+query-completion commit but never committed its own transaction. This includes
+already-recorded checkpoints. It could retain SQLite's writer slot while waiting
+for the next browser worker, causing that worker's immediate persistence to time
+out. Recent production errors repeatedly reported `database is locked`; the
+20-query error window then restricted concurrency to one browser.
+
+A real SQLite regression test failed before the fix because the controller
+remained in a transaction. Checkpoint writes now commit before returning. The
+test checks both first-time and repeated checkpoints and acquisition of the
+writer slot from a separate connection. Live rollout/throughput verification
+remains required; this is not yet a measured end-to-end speed improvement.
+
 ## Scope and baseline
 
 Requested: review the full codebase, research methodology, improve throughput on
