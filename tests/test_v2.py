@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from batch_collect_malaysia_v2 import (
     QueryTask,
+    MARKET_ORDER_CYCLE,
+    MARKET_REORDER_INTERVAL,
     PENINSULAR_EXPANSION_GDP_2025,
     PENINSULAR_PILOT_LOCALITIES,
     CLASSIFICATION_ONLY_INDUSTRIES,
@@ -132,7 +134,9 @@ class V3CollectorTests(unittest.TestCase):
         tasks = [QueryTask(f"{state}-{index}", "Finance", "City", state, "accounting firm")
                  for state in states for index in range(30)]
         ranked = weighted_market_order(tasks)
-        first = ranked[:23]
+        self.assertEqual(MARKET_REORDER_INTERVAL, len(MARKET_ORDER_CYCLE))
+        self.assertEqual(MARKET_REORDER_INTERVAL, 23)
+        first = ranked[:MARKET_REORDER_INTERVAL]
         self.assertEqual(sum(task.state == "Selangor" for task in first), 11)
         self.assertEqual(sum(task.state == "Johor" for task in first), 5)
         self.assertEqual(sum(task.state == "Penang" for task in first), 4)

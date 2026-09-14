@@ -377,10 +377,10 @@ English/Malay extraction and its waits alongside grouped contact rollout.
   until memory rises or each browser's footprint falls.
 - Repeated, identical Maps observations now skip the writer lock and scoring.
   Writes taking at least two seconds log lock-wait and transaction timings.
-- Pending work is ranked within the existing 55/25/20 market allocation using
+- Pending work is ranked within the current 48/22/17/13 market allocation using
   measured A/B leads per query-hour by term, state and geo level, with one in
   five slots retained for static-priority exploration. Recent rates are
-  recalculated every ten completed queries; newly generated children no longer
+  recalculated after each full market rotation; newly generated children no longer
   monopolize the front of the queue.
 - These changes passed 55 local unit/integration tests. The claimed doubling
   of qualified leads per hour is a target, not yet a measured result; compare
@@ -413,3 +413,17 @@ English/Malay extraction and its waits alongside grouped contact rollout.
   leads per hour. Measured group rates still override it, and every fifth
   market slot still explores by strategic priority. This is a queue-ordering
   change, not a claim that the earlier throughput will immediately return.
+
+### 15 September 2026: complete market rotation before re-ranking
+
+- The 04:14-06:14 MYT window produced about 794 unique companies versus 970
+  in the previous two hours. Completed queries fell from 116 to 91, while
+  several current Selangor terms had high duplicate rates. There were no
+  Google throttles or storage-lock errors; RAM management temporarily reduced
+  concurrency as free memory dipped below 0.5 GB.
+- Queue re-ranking occurred after every ten completed searches, but the
+  configured market cycle has 23 slots: 11 Klang Valley, 5 Johor, 4 Penang
+  and 3 GDP-ranked Peninsular expansion. Resetting the queue early could
+  repeatedly postpone Penang and expansion searches. Re-ranking now waits
+  for a complete 23-query rotation. This preserves the existing geography
+  weights and changes no source data or qualification rules.

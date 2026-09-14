@@ -222,6 +222,12 @@ PENINSULAR_PILOT_TERMS: tuple[tuple[str, str], ...] = (
     ("Interior Design", "interior designer"),
 )
 
+# A queue refresh must let the full market rotation run first; refreshing after
+# ten completions repeatedly moved Penang and the GDP pilot behind core markets.
+MARKET_ORDER_CYCLE = (("Klang Valley",) * 11 + ("Johor",) * 5 +
+                      ("Penang",) * 4 + ("Peninsular Expansion",) * 3)
+MARKET_REORDER_INTERVAL = len(MARKET_ORDER_CYCLE)
+
 CLASSIFICATION_ONLY_INDUSTRIES = ("Government", "Others")
 
 # Lower values run first. Previously covered Education/Home categories remain
@@ -733,7 +739,7 @@ def weighted_market_order(tasks: list[QueryTask]) -> list[QueryTask]:
         group_lists.setdefault(market_name(task.state), []).append(task)
     groups = {name: deque(rank_peninsular_expansion(group) if name == "Peninsular Expansion"
                           else rank_market_tasks(group)) for name, group in group_lists.items()}
-    cycle = ["Klang Valley"] * 11 + ["Johor"] * 5 + ["Penang"] * 4 + ["Peninsular Expansion"] * 3
+    cycle = MARKET_ORDER_CYCLE
     ordered: list[QueryTask] = []
     while any(groups.get(name) for name in cycle):
         progressed = False
@@ -1577,7 +1583,7 @@ def run_batch(args: argparse.Namespace) -> int:
                                     task_by_prompt[child.prompt] = child
                                     pending.append(child)
                                     known.add(child.prompt)
-                    if session_completed % 10 == 0 and pending:
+                    if session_completed % MARKET_REORDER_INTERVAL == 0 and pending:
                         pending = deque(weighted_market_order(with_expected_speed(
                             list(pending), observed_ab_hourly_rates(conn),
                         )))
