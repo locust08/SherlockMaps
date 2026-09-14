@@ -11,6 +11,8 @@ from batch_collect_malaysia_v2 import (
     SECTOR_TERMS,
     build_manifest,
     desired_worker_count,
+    recent_error_rate,
+    is_storage_lock_error,
     open_db,
     persist_observation,
     qualified_count,
@@ -21,6 +23,9 @@ from batch_collect_malaysia_v2 import (
     submission_allowed,
     TARGET,
     observed_ab_yields,
+    observed_ab_hourly_rates,
+    rank_market_tasks,
+    with_expected_speed,
     yield_estimate_cache,
     expected_ab_yield,
 )
@@ -33,6 +38,28 @@ from progress_dashboard import NAV_ITEMS, call_list_query, dashboard_page, navig
 
 
 class V3CollectorTests(unittest.TestCase):
+    def test_recent_sales_ready_query_speed_and_exploration(self) -> None:
+        tasks = [QueryTask(f"dentist speed {i}", self.task.sector, self.task.locality,
+                           self.task.state, self.task.term, "district") for i in range(3)]
+        register_manifest(self.conn, tasks)
+        self.conn.execute(
+            """UPDATE search_jobs SET status='completed',qualified_new=20,ab_leads_new=20,
+               started_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-10 minutes'),
+               completed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"""
+        )
+        self.conn.commit()
+        rates = observed_ab_hourly_rates(self.conn)
+        self.assertAlmostEqual(rates[(self.task.sector, self.task.term, self.task.state, "district")], 120, delta=1)
+        candidates = [QueryTask(f"speed{i}", self.task.sector, "Bangsar", self.task.state,
+                                self.task.term, "district", priority=20,
+                                expected_ab_per_hour=100-i*10) for i in range(5)]
+        explorer = QueryTask("explore", self.task.sector, "Bangsar", self.task.state,
+                             "new term", "district", priority=1, expected_ab_per_hour=0)
+        ranked = rank_market_tasks(candidates + [explorer])
+        self.assertEqual([task.prompt for task in ranked[:5]],
+                         ["speed0", "speed1", "speed2", "speed3", "explore"])
+        self.assertEqual(with_expected_speed([self.task], rates)[0].expected_ab_per_hour, 120)
+
     def test_observed_sales_yield_preserves_zero_and_bounds_overlap(self) -> None:
         tasks = [QueryTask(f"dentist fixture {i}", self.task.sector, self.task.locality,
                            self.task.state, self.task.term, "district") for i in range(3)]
@@ -135,22 +162,23 @@ class V3CollectorTests(unittest.TestCase):
     def test_ram_worker_headroom(self) -> None:
         self.assertEqual(desired_worker_count(4.0, current_limit=1), 4)
         for current_limit in (1, 2, 3):
-            for free_ram in (1.0, 1.07, 1.99):
+            for free_ram in (0.5, 1.07, 1.49):
                 self.assertEqual(desired_worker_count(free_ram, current_limit=current_limit), current_limit)
-            self.assertEqual(desired_worker_count(2.0, current_limit=current_limit), 4)
-        self.assertEqual(desired_worker_count(2.0, current_limit=4), 5)
-        self.assertEqual(desired_worker_count(1.99, current_limit=4), 4)
-        self.assertEqual(desired_worker_count(2.0, current_limit=5), 5)
+            self.assertEqual(desired_worker_count(1.5, current_limit=current_limit), 4)
+        self.assertEqual(desired_worker_count(1.5, current_limit=4), 5)
+        self.assertEqual(desired_worker_count(1.49, current_limit=4), 4)
+        self.assertEqual(desired_worker_count(1.5, current_limit=5), 5)
         self.assertEqual(desired_worker_count(
-            2.0, current_limit=5, five_worker_canary_complete=True
+            1.5, current_limit=5, five_worker_canary_complete=True
         ), 6)
-        self.assertEqual(desired_worker_count(0.99, current_limit=6), 4)
-        self.assertEqual(desired_worker_count(0.64, current_limit=4), 3)
+        self.assertEqual(desired_worker_count(0.49, current_limit=6), 5)
+        self.assertEqual(desired_worker_count(0.49, current_limit=4), 3)
+        self.assertEqual(desired_worker_count(0.5, current_limit=6), 6)
         self.assertEqual(desired_worker_count(4.0, cooldown=True), 1)
         self.assertEqual(desired_worker_count(4.0, error_rate=0.05), 1)
-        self.assertEqual(ram_operating_state(2.0), "healthy")
+        self.assertEqual(ram_operating_state(1.5), "healthy")
         self.assertEqual(ram_operating_state(1.0), "constrained")
-        self.assertEqual(ram_operating_state(0.64), "critical")
+        self.assertEqual(ram_operating_state(0.49), "critical")
         self.assertEqual(worker_upscale_stable_seconds(4), 10)
         self.assertEqual(worker_upscale_stable_seconds(5), 60)
         self.assertEqual(worker_upscale_stable_seconds(6), 300)
@@ -159,8 +187,31 @@ class V3CollectorTests(unittest.TestCase):
         self.assertFalse(submission_allowed(8.0, 100.0, 1000.0))
         self.assertFalse(submission_allowed(8.0, 999.99, 1000.0))
         self.assertTrue(submission_allowed(8.0, 1000.0, 1000.0))
-        self.assertFalse(submission_allowed(0.64, 1001.0, 1000.0))
-        self.assertTrue(submission_allowed(0.65, 1001.0, 1000.0))
+        self.assertFalse(submission_allowed(0.49, 1001.0, 1000.0))
+        self.assertTrue(submission_allowed(0.5, 1001.0, 1000.0))
+
+    def test_sqlite_lock_recovery_keeps_progress_without_disabling_google_controls(self) -> None:
+        self.assertTrue(is_storage_lock_error(
+            "ExtractionError: Failed (Caused by: database is locked)"))
+        self.assertFalse(is_storage_lock_error("GOOGLE_BLOCK: unusual traffic"))
+        self.assertEqual(desired_worker_count(3.29, current_limit=6,
+                                             five_worker_canary_complete=True,
+                                             storage_lock_recovery=True), 3)
+        self.assertEqual(desired_worker_count(3.29, current_limit=1,
+                                             storage_lock_recovery=True), 3)
+        self.assertEqual(desired_worker_count(3.29, current_limit=3,
+                                             cooldown=True,
+                                             storage_lock_recovery=True), 1)
+        self.assertEqual(desired_worker_count(3.29, current_limit=3,
+                                             error_rate=0.05,
+                                             storage_lock_recovery=True), 1)
+
+    def test_browser_errors_age_out_instead_of_latching_at_one_browser(self) -> None:
+        from collections import deque
+        outcomes = deque([(100.0, 1), (105.0, 0)], maxlen=20)
+        self.assertEqual(recent_error_rate(outcomes, 106.0), 0.5)
+        self.assertEqual(recent_error_rate(outcomes, 706.0), 0.0)
+        self.assertEqual(len(outcomes), 0)
 
     def test_lightweight_browser_config(self) -> None:
         config = CrawlerConfig(headless=True)

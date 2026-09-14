@@ -50,12 +50,14 @@ MAXIMUM_WORKERS = 6
 MAX_ATTEMPTS = 3
 PILOT_QUERIES = 120
 THROTTLE_COOLDOWN_SECONDS = 15 * 60
-RAM_POLICY_MODE = "adaptive_5_canary_6_max"
-RAM_RESERVE_GB = 1.0
-RAM_LAUNCH_THRESHOLD_GB = 2.0
-RAM_CRITICAL_GB = 0.65
+RAM_POLICY_MODE = "adaptive_5_canary_6_max_half_gb_floor"
+RAM_RESERVE_GB = 0.5
+RAM_LAUNCH_THRESHOLD_GB = 1.5
+RAM_CRITICAL_GB = 0.5
 MEMORY_PRESSURE_GRACE_SECONDS = 15
 MEMORY_RECOVERY_COOLDOWN_SECONDS = 15
+STORAGE_LOCK_RECOVERY_SECONDS = 3 * 60
+OUTCOME_WINDOW_SECONDS = 10 * 60
 RAM_CANARY_QUERIES = 20
 RAM_BASE_UPSCALE_STABLE_SECONDS = 10
 RAM_FIFTH_UPSCALE_STABLE_SECONDS = 60
@@ -74,6 +76,7 @@ class QueryTask:
     priority: int = 100
     strategy_bucket: str = "commercial"
     expected_ab_yield: float = 0.0
+    expected_ab_per_hour: float = 0.0
     initial_results: int = INITIAL_RESULTS
     adaptive_results: int = ADAPTIVE_RESULTS
     hard_result_cap: int = HARD_RESULT_CAP
@@ -628,11 +631,59 @@ def yield_estimate_cache(conn: sqlite3.Connection | None) -> dict[tuple[str, str
     return cache
 
 
+def observed_ab_hourly_rates(conn: sqlite3.Connection | None) -> dict[tuple[str, str, str, str], float]:
+    """Recent sales-ready lead speed by term, state and location granularity."""
+    if conn is None:
+        return {}
+    return {
+        (str(sector), str(term), str(state), str(geo_level)): min(200.0, round(float(leads) / float(hours), 2))
+        for sector, term, state, geo_level, leads, hours in conn.execute(
+            """SELECT sector,term,state,geo_level,
+                      SUM(MAX(0,MIN(COALESCE(ab_leads_new,0),COALESCE(qualified_new,0)))),
+                      SUM(MAX(1.0/60.0,(julianday(completed_at)-julianday(started_at))*24.0))
+               FROM search_jobs
+               WHERE taxonomy_version=4 AND status='completed'
+                 AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                 AND julianday(completed_at)>=julianday('now','-14 days')
+               GROUP BY sector,term,state,geo_level
+               HAVING COUNT(*)>=3 AND
+                      SUM(MAX(1.0/60.0,(julianday(completed_at)-julianday(started_at))*24.0))>=0.25"""
+        ) if hours and hours > 0
+    }
+
+
+def with_expected_speed(tasks: list[QueryTask], rates: dict[tuple[str, str, str, str], float]) -> list[QueryTask]:
+    return [replace(task, expected_ab_per_hour=rates.get(
+        (task.sector, task.term, task.state, task.geo_level),
+        min(150.0, task.expected_ab_yield * 7.5),
+    )) for task in tasks]
+
+
+def rank_market_tasks(tasks: list[QueryTask]) -> list[QueryTask]:
+    """Four measured-speed searches for each priority-led exploration search."""
+    tasks = list({task.prompt: task for task in tasks}.values())
+    by_speed = deque(sorted(tasks, key=lambda item: (-item.expected_ab_per_hour, item.priority, item.prompt)))
+    by_priority = deque(sorted(tasks, key=lambda item: (item.priority, -item.expected_ab_yield, item.prompt)))
+    ranked: list[QueryTask] = []
+    seen: set[str] = set()
+    while len(ranked) < len(tasks):
+        for source, slots in ((by_speed, 4), (by_priority, 1)):
+            for _ in range(slots):
+                while source and source[0].prompt in seen:
+                    source.popleft()
+                if source:
+                    task = source.popleft()
+                    ranked.append(task)
+                    seen.add(task.prompt)
+    return ranked
+
+
 def weighted_market_order(tasks: list[QueryTask]) -> list[QueryTask]:
     """Interleave tasks at 55% Klang Valley, 25% Johor, and 20% Penang."""
-    groups: dict[str, deque[QueryTask]] = {name: deque() for name in ("Klang Valley", "Johor", "Penang")}
-    for task in sorted(tasks, key=lambda item: (item.priority, -item.expected_ab_yield, item.term, item.prompt)):
-        groups.setdefault(market_name(task.state), deque()).append(task)
+    group_lists: dict[str, list[QueryTask]] = {name: [] for name in ("Klang Valley", "Johor", "Penang")}
+    for task in tasks:
+        group_lists.setdefault(market_name(task.state), []).append(task)
+    groups = {name: deque(rank_market_tasks(group)) for name, group in group_lists.items()}
     cycle = ["Klang Valley"] * 11 + ["Johor"] * 5 + ["Penang"] * 4
     ordered: list[QueryTask] = []
     while any(groups.get(name) for name in cycle):
@@ -726,7 +777,7 @@ def build_manifest(conn: sqlite3.Connection | None = None) -> list[QueryTask]:
             if len(existing_prompts) >= 15_500:
                 break
     unique = {task.prompt: task for task in tasks}
-    return weighted_market_order(list(unique.values()))
+    return weighted_market_order(with_expected_speed(list(unique.values()), observed_ab_hourly_rates(conn)))
 
 
 def expand_task(task: QueryTask) -> list[QueryTask]:
@@ -870,19 +921,37 @@ def persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str
     # or provenance if any part of the observation fails.
     if conn.in_transaction:
         raise RuntimeError("Observation persistence requires a clean transaction")
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
-        return _persist_observation(conn, task, raw)
+    observation_key = observation_identity(task, raw)
+    # A previously committed observation needs no writer lock or re-scoring.
+    # Recheck inside the write transaction below to handle concurrent inserts.
+    if conn.execute("SELECT 1 FROM raw_observations WHERE observation_key=?", (observation_key,)).fetchone():
+        return "duplicate_observation"
+    started = time.monotonic()
+    acquired: float | None = None
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            acquired = time.monotonic()
+            return _persist_observation(conn, task, raw, observation_key)
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= 2:
+            wait = (acquired or time.monotonic()) - started
+            logging.warning("SLOW_DB_WRITE wait=%.2fs transaction=%.2fs prompt=%s",
+                            wait, max(0.0, elapsed - wait), task.prompt)
 
 
-def _persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, Any]) -> str:
+def observation_identity(task: QueryTask, raw: dict[str, Any]) -> str:
     key_source = "|".join((task.prompt, usable(raw.get("place_id")), usable(raw.get("source_url")), usable(raw.get("name")), usable(raw.get("address"))))
-    observation_key = hashlib.sha256(key_source.encode("utf-8", errors="ignore")).hexdigest()
+    return hashlib.sha256(key_source.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _persist_observation(conn: sqlite3.Connection, task: QueryTask, raw: dict[str, Any], observation_key: str) -> str:
     existing = conn.execute("SELECT rejection_reason,company_id FROM raw_observations WHERE observation_key=?", (observation_key,)).fetchone()
     if existing:
-        if existing[1]:
-            set_company_classification(conn, int(existing[1]), task.sector, 90, "search_term")
-            score_company(conn, int(existing[1]))
+        # This exact prompt/listing observation was already saved atomically.
+        # Re-scoring it writes the same lead and sales rows under SQLite's single
+        # writer lock, which is especially costly during crash-safe retries.
         return "duplicate_observation"
     reason, company_id = save_one_result(conn, task, raw)
     conn.execute(
@@ -968,30 +1037,44 @@ def desired_worker_count(
     error_rate: float = 0.0,
     current_limit: int = 1,
     five_worker_canary_complete: bool = False,
+    storage_lock_recovery: bool = False,
 ) -> int:
     if cooldown:
-        return 1
-    if error_rate >= 0.05:
         return 1
     if available_ram < RAM_CRITICAL_GB:
         return max(1, current_limit - 1)
     if available_ram < RAM_RESERVE_GB:
         return min(current_limit, BASE_WORKERS)
+    if error_rate >= 0.05:
+        return 1
 
     preferred = max(1, min(preferred, maximum, MAXIMUM_WORKERS))
     maximum = max(preferred, min(maximum, MAXIMUM_WORKERS))
     if current_limit < min(preferred, BASE_WORKERS):
         # Base workers consume RAM too. Previously this bypassed the launch
         # threshold and oscillated between launch and reclaim near 1 GB free.
-        return (min(preferred, BASE_WORKERS)
-                if available_ram >= RAM_LAUNCH_THRESHOLD_GB else current_limit)
-    if current_limit < preferred:
-        return preferred if available_ram >= RAM_LAUNCH_THRESHOLD_GB else current_limit
-    if (current_limit == preferred and maximum > preferred
+        desired = (min(preferred, BASE_WORKERS)
+                   if available_ram >= RAM_LAUNCH_THRESHOLD_GB else current_limit)
+    elif current_limit < preferred:
+        desired = preferred if available_ram >= RAM_LAUNCH_THRESHOLD_GB else current_limit
+    elif (current_limit == preferred and maximum > preferred
             and five_worker_canary_complete
             and available_ram >= RAM_LAUNCH_THRESHOLD_GB):
-        return min(preferred + 1, maximum)
-    return min(current_limit, maximum)
+        desired = min(preferred + 1, maximum)
+    else:
+        desired = min(current_limit, maximum)
+    return min(desired, 3) if storage_lock_recovery else desired
+
+
+def recent_error_rate(outcomes: deque[tuple[float, int]], now: float) -> float:
+    """Only recent browser failures control browser-health concurrency."""
+    while outcomes and outcomes[0][0] < now - OUTCOME_WINDOW_SECONDS:
+        outcomes.popleft()
+    return sum(failed for _, failed in outcomes) / len(outcomes) if outcomes else 0.0
+
+
+def is_storage_lock_error(error: str) -> bool:
+    return "database is locked" in error.lower() or "database table is locked" in error.lower()
 
 
 def worker_upscale_stable_seconds(next_worker_count: int) -> int:
@@ -1117,6 +1200,9 @@ def write_status(
         "ram_policy_mode": RAM_POLICY_MODE,
         "ram_operating_state": ram_operating_state(ram),
         "memory_pressure_pauses": int(diagnostics.get("memory_pressure_pauses", 0)),
+        "storage_lock_errors": int(diagnostics.get("storage_lock_errors", 0)),
+        "storage_lock_recovery_until": diagnostics.get("storage_lock_recovery_until"),
+        "browser_error_rate_10m": float(diagnostics.get("browser_error_rate_10m", 0)),
         "reclaimed_jobs": int(diagnostics.get("reclaimed_jobs", 0)),
         "lowest_available_ram_gb": diagnostics.get("lowest_available_ram_gb", ram),
         "lowest_available_ram_at": diagnostics.get("lowest_available_ram_at"),
@@ -1215,18 +1301,20 @@ def run_batch(args: argparse.Namespace) -> int:
         (task.taxonomy_version, task.prompt),
     ).fetchone()[0] in {"pending", "failed"})
     active: dict[concurrent.futures.Future[CrawlOutcome], QueryTask] = {}
-    outcomes = deque(maxlen=20)
+    outcomes: deque[tuple[float, int]] = deque(maxlen=20)
     throttle_times: deque[float] = deque()
     upscale_candidate: int | None = None
     upscale_candidate_since: float | None = None
     five_worker_canary_prompts: set[str] = set()
     cooldown_until = 0.0
+    storage_lock_recovery_until = 0.0
     halt_reason: str | None = None
     pilot_status = "running"
     session_completed = 0
     initial_ram = available_memory_gb()
     diagnostics: dict[str, Any] = {
         "memory_pressure_pauses": 0,
+        "storage_lock_errors": 0,
         "reclaimed_jobs": 0,
         "page_recycle_count": 0,
         "memory_cleanup_count": 0,
@@ -1248,7 +1336,12 @@ def run_batch(args: argparse.Namespace) -> int:
             if ram < float(diagnostics["lowest_available_ram_gb"]):
                 diagnostics["lowest_available_ram_gb"] = ram
                 diagnostics["lowest_available_ram_at"] = utc_now()
-            error_rate = sum(outcomes) / len(outcomes) if outcomes else 0.0
+            error_rate = recent_error_rate(outcomes, now)
+            diagnostics["browser_error_rate_10m"] = round(error_rate, 3)
+            diagnostics["storage_lock_recovery_until"] = (
+                datetime.fromtimestamp(storage_lock_recovery_until, timezone.utc).isoformat()
+                if now < storage_lock_recovery_until else None
+            )
             desired_limit = desired_worker_count(
                 ram, preferred=min(args.workers, args.max_workers),
                 maximum=args.max_workers,
@@ -1257,6 +1350,7 @@ def run_batch(args: argparse.Namespace) -> int:
                 five_worker_canary_complete=(
                     int(diagnostics["ram_canary_completed"]) >= RAM_CANARY_QUERIES
                 ),
+                storage_lock_recovery=now < storage_lock_recovery_until,
             )
             if desired_limit < effective_limit:
                 effective_limit = desired_limit
@@ -1335,15 +1429,22 @@ def run_batch(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     outcome = CrawlOutcome(task, error=f"ControllerError: {type(exc).__name__}: {exc}")
                 memory_reclaimed = bool(outcome.error and "memory_pressure" in outcome.error.lower())
-                if not memory_reclaimed:
-                    outcomes.append(1 if outcome.error else 0)
+                storage_locked = bool(outcome.error and is_storage_lock_error(outcome.error))
+                if not memory_reclaimed and not storage_locked:
+                    outcomes.append((time.time(), 1 if outcome.error else 0))
+                if storage_locked:
+                    storage_lock_recovery_until = max(
+                        storage_lock_recovery_until, time.time() + STORAGE_LOCK_RECOVERY_SECONDS
+                    )
+                    diagnostics["storage_lock_errors"] += 1
+                    record_event(conn, "storage_lock_recovery", outcome.error, min(effective_limit, 3))
                 if outcome.error:
                     row = conn.execute(
                         "SELECT attempts FROM search_jobs WHERE taxonomy_version=? AND prompt=?",
                         (TAXONOMY_VERSION, task.prompt),
                     ).fetchone()
                     attempts = int(row[0])
-                    if memory_reclaimed:
+                    if memory_reclaimed or storage_locked:
                         conn.execute(
                             """UPDATE search_jobs SET status='pending',attempts=?,completed_at=NULL,
                                processed_count=?,error=?,throttle_detected=0,worker_id=NULL
@@ -1352,12 +1453,15 @@ def run_batch(args: argparse.Namespace) -> int:
                              TAXONOMY_VERSION, task.prompt),
                         )
                         pending.append(task)
-                        diagnostics["memory_pressure_pauses"] += 1
-                        diagnostics["reclaimed_jobs"] += 1
-                        cooldown_until = max(cooldown_until, time.time() + MEMORY_RECOVERY_COOLDOWN_SECONDS)
-                        effective_limit = 1
-                        record_event(conn, "memory_pressure_reclaim", outcome.error, effective_limit)
-                        logging.warning("MEMORY RECLAIMED %s after %s processed", task.prompt, outcome.processed_count)
+                        if memory_reclaimed:
+                            diagnostics["memory_pressure_pauses"] += 1
+                            diagnostics["reclaimed_jobs"] += 1
+                            cooldown_until = max(cooldown_until, time.time() + MEMORY_RECOVERY_COOLDOWN_SECONDS)
+                            effective_limit = 1
+                            record_event(conn, "memory_pressure_reclaim", outcome.error, effective_limit)
+                            logging.warning("MEMORY RECLAIMED %s after %s processed", task.prompt, outcome.processed_count)
+                        else:
+                            logging.warning("STORAGE LOCK RETRY %s after %s processed", task.prompt, outcome.processed_count)
                     else:
                         conn.execute("UPDATE search_jobs SET status='failed',completed_at=?,processed_count=?,error=?,throttle_detected=? WHERE taxonomy_version=? AND prompt=?",
                                      (utc_now(), outcome.processed_count, outcome.error, int(outcome.throttled), TAXONOMY_VERSION, task.prompt))
@@ -1370,9 +1474,9 @@ def run_batch(args: argparse.Namespace) -> int:
                         effective_limit = 1
                         if len(throttle_times) >= 2:
                             halt_reason = "Persistent Google block/throttle detected twice within two hours."
-                    elif not memory_reclaimed and attempts < MAX_ATTEMPTS:
+                    elif not memory_reclaimed and not storage_locked and attempts < MAX_ATTEMPTS:
                         pending.append(task)
-                    if not memory_reclaimed:
+                    if not memory_reclaimed and not storage_locked:
                         logging.error("FAILED %s: %s", task.prompt, outcome.error)
                 else:
                     ab_leads_new = count_ab_leads_for_prompt(conn, task)
@@ -1408,8 +1512,12 @@ def run_batch(args: argparse.Namespace) -> int:
                             for child in children:
                                 if child.prompt not in known:
                                     task_by_prompt[child.prompt] = child
-                                    pending.appendleft(child)
+                                    pending.append(child)
                                     known.add(child.prompt)
+                    if session_completed % 10 == 0 and pending:
+                        pending = deque(weighted_market_order(with_expected_speed(
+                            list(pending), observed_ab_hourly_rates(conn),
+                        )))
                 conn.commit()
                 count = qualified_count(conn)
                 record_checkpoints(conn, count, args.target)

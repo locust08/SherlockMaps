@@ -50,6 +50,19 @@ class PersistenceTests(unittest.TestCase):
         for table in ("companies", "provenance", "raw_observations"):
             self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 1)
 
+    def test_repeated_observation_does_not_wait_for_writer_or_rescore(self):
+        self.assertEqual(persist_observation(self.conn, self.task, self.raw), "new")
+        other = worker_connection(self.path)
+        other.execute("BEGIN IMMEDIATE")
+        try:
+            with patch("batch_collect_malaysia_v2.score_company") as score:
+                self.assertEqual(persist_observation(self.conn, self.task, self.raw), "duplicate_observation")
+                score.assert_not_called()
+        finally:
+            other.rollback()
+            other.close()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM raw_observations").fetchone()[0], 1)
+
     def test_worker_never_creates_empty_database(self):
         missing = self.path.parent / "missing.sqlite"
         with self.assertRaises(sqlite3.OperationalError):

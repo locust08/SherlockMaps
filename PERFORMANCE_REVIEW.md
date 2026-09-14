@@ -362,3 +362,26 @@ English/Malay extraction and its waits alongside grouped contact rollout.
   completeness, accepted/rejected counts, blocks, RAM and durable persistence.
 - Complete rollout and push the final tested changes. Only then mark the overall
   optimization goal complete.
+
+### 14 September 2026: recovery and yield scheduling
+
+- The apparent one-browser RAM limit was caused by SQLite `database is locked`
+  failures at six browsers being counted as browser failures. The controller
+  now isolates storage-lock recovery from browser and Google-block health,
+  temporarily caps concurrency at three for three minutes, and then resumes
+  gradual scaling. Storage-lock retries return to pending without consuming a
+  query attempt. Google CAPTCHA/throttle rules are unchanged.
+- The RAM reserve is 0.5 GB with a 1.5 GB launch threshold. This is a floor,
+  not a promise of six concurrent browsers: four active browsers left about
+  1.3 GB free on this laptop during rollout. Launching another would be unsafe
+  until memory rises or each browser's footprint falls.
+- Repeated, identical Maps observations now skip the writer lock and scoring.
+  Writes taking at least two seconds log lock-wait and transaction timings.
+- Pending work is ranked within the existing 55/25/20 market allocation using
+  measured A/B leads per query-hour by term, state and geo level, with one in
+  five slots retained for static-priority exploration. Recent rates are
+  recalculated every ten completed queries; newly generated children no longer
+  monopolize the front of the queue.
+- These changes passed 55 local unit/integration tests. The claimed doubling
+  of qualified leads per hour is a target, not yet a measured result; compare
+  equal rolling windows after enough post-restart queries finish.
