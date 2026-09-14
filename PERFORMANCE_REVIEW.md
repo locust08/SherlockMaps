@@ -400,3 +400,16 @@ English/Malay extraction and its waits alongside grouped contact rollout.
   three cities per pilot state. Existing nationwide data and query history are
   preserved; lower-GDP Peninsular states remain possible future tests.
 - Source: https://www.dosm.gov.my/portal-main/release-content/gross-domestic-product-gdp-by-state-2025
+
+### 15 September 2026: unsampled-query fallback
+
+- The 00:12-02:12 MYT window produced about 980 unique companies versus 2,246
+  in the preceding two hours, despite six healthy browsers. Completed-query
+  duplicate share rose from about 48% to 67%; postcode-heavy coffee-shop
+  searches were a major contributor.
+- Unsampled term/location groups previously inherited a sector-wide A/B yield
+  and an optimistic 7.5-queries-per-hour speed assumption (capped at 150).
+  The speed estimate is now 3 times the inherited yield, capped at 60 A/B
+  leads per hour. Measured group rates still override it, and every fifth
+  market slot still explores by strategic priority. This is a queue-ordering
+  change, not a claim that the earlier throughput will immediately return.

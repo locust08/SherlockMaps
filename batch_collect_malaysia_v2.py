@@ -58,6 +58,11 @@ MEMORY_PRESSURE_GRACE_SECONDS = 15
 MEMORY_RECOVERY_COOLDOWN_SECONDS = 15
 STORAGE_LOCK_RECOVERY_SECONDS = 3 * 60
 OUTCOME_WINDOW_SECONDS = 10 * 60
+# Unsampled term/location groups receive conservative capacity. One in five
+# scheduler slots already explores by strategic priority, so an optimistic
+# sector-wide fallback should not outrank proven high-yield groups.
+UNSAMPLED_AB_RATE_MULTIPLIER = 3.0
+UNSAMPLED_AB_RATE_CAP = 60.0
 RAM_CANARY_QUERIES = 20
 RAM_BASE_UPSCALE_STABLE_SECONDS = 10
 RAM_FIFTH_UPSCALE_STABLE_SECONDS = 60
@@ -681,7 +686,7 @@ def observed_ab_hourly_rates(conn: sqlite3.Connection | None) -> dict[tuple[str,
 def with_expected_speed(tasks: list[QueryTask], rates: dict[tuple[str, str, str, str], float]) -> list[QueryTask]:
     return [replace(task, expected_ab_per_hour=rates.get(
         (task.sector, task.term, task.state, task.geo_level),
-        min(150.0, task.expected_ab_yield * 7.5),
+        min(UNSAMPLED_AB_RATE_CAP, task.expected_ab_yield * UNSAMPLED_AB_RATE_MULTIPLIER),
     )) for task in tasks]
 
 

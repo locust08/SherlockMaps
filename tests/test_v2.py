@@ -64,6 +64,17 @@ class V3CollectorTests(unittest.TestCase):
                          ["speed0", "speed1", "speed2", "speed3", "explore"])
         self.assertEqual(with_expected_speed([self.task], rates)[0].expected_ab_per_hour, 120)
 
+    def test_unsampled_speed_is_conservative_and_cannot_outrank_proven_group(self) -> None:
+        unknown = QueryTask("unknown", "Education", "Bangsar", "Selangor",
+                            "new course", expected_ab_yield=30)
+        measured = QueryTask("measured", "Education", "Bangsar", "Selangor",
+                             "known course", expected_ab_yield=10)
+        speeds = with_expected_speed([unknown, measured],
+                                     {("Education", "known course", "Selangor", "city"): 80})
+        self.assertEqual(speeds[0].expected_ab_per_hour, 60)
+        self.assertEqual(speeds[1].expected_ab_per_hour, 80)
+        self.assertEqual(rank_market_tasks(speeds)[0].prompt, "measured")
+
     def test_observed_sales_yield_preserves_zero_and_bounds_overlap(self) -> None:
         tasks = [QueryTask(f"dentist fixture {i}", self.task.sector, self.task.locality,
                            self.task.state, self.task.term, "district") for i in range(3)]
