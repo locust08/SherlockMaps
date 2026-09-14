@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from batch_collect_malaysia_v2 import (
     QueryTask,
+    PENINSULAR_EXPANSION_GDP_2025,
+    PENINSULAR_PILOT_LOCALITIES,
     CLASSIFICATION_ONLY_INDUSTRIES,
     SECTOR_TERMS,
     build_manifest,
@@ -25,6 +27,8 @@ from batch_collect_malaysia_v2 import (
     observed_ab_yields,
     observed_ab_hourly_rates,
     rank_market_tasks,
+    rank_peninsular_expansion,
+    weighted_market_order,
     with_expected_speed,
     yield_estimate_cache,
     expected_ab_yield,
@@ -100,7 +104,34 @@ class V3CollectorTests(unittest.TestCase):
         self.assertEqual(len({task.sector for task in manifest}), 26)
         self.assertTrue(set(CLASSIFICATION_ONLY_INDUSTRIES).isdisjoint(SECTOR_TERMS))
         self.assertEqual(TARGET, 400_000)
-        self.assertEqual({task.state for task in manifest}, {"Selangor", "Federal Territory", "Johor", "Penang"})
+        self.assertEqual({task.state for task in manifest}, {
+            "Selangor", "Federal Territory", "Johor", "Penang",
+            "Perak", "Pahang", "Kedah", "Negeri Sembilan", "Melaka",
+        })
+        self.assertEqual([state for state, _ in PENINSULAR_EXPANSION_GDP_2025],
+                         ["Perak", "Pahang", "Kedah", "Negeri Sembilan", "Melaka"])
+        self.assertTrue(all(task.state in PENINSULAR_PILOT_LOCALITIES
+                            for task in manifest if task.state not in {
+                                "Selangor", "Federal Territory", "Johor", "Penang",
+                            }))
+
+    def test_market_cycle_protects_core_and_interleaves_gdp_pilot(self) -> None:
+        states = ["Selangor", "Johor", "Penang", "Perak", "Pahang", "Kedah",
+                  "Negeri Sembilan", "Melaka"]
+        tasks = [QueryTask(f"{state}-{index}", "Finance", "City", state, "accounting firm")
+                 for state in states for index in range(30)]
+        ranked = weighted_market_order(tasks)
+        first = ranked[:23]
+        self.assertEqual(sum(task.state == "Selangor" for task in first), 11)
+        self.assertEqual(sum(task.state == "Johor" for task in first), 5)
+        self.assertEqual(sum(task.state == "Penang" for task in first), 4)
+        self.assertEqual(sum(task.state not in {"Selangor", "Johor", "Penang"}
+                             for task in first), 3)
+        expansion = rank_peninsular_expansion([
+            task for task in tasks if task.state in PENINSULAR_PILOT_LOCALITIES
+        ])
+        self.assertEqual([task.state for task in expansion[:5]], ["Perak"] * 5)
+        self.assertEqual([task.state for task in expansion[5:9]], ["Pahang"] * 4)
 
     def test_website_build_lead_is_accepted(self) -> None:
         reason = persist_observation(self.conn, self.task, {

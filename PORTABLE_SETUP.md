@@ -50,7 +50,7 @@ Open [http://localhost:8765/](http://localhost:8765/). The collector resumes pen
 
 The dashboard provides live progress, ranked leads, market/industry coverage, a sales pipeline, a brand-deduplicated A/B call-list CSV, full CSV/Excel exports and PIC CSV re-import. Generated Excel files are written to `data\sherlockmaps-companies.xlsx`.
 
-V4 resumes toward 400,000 unique locations. New searches focus on Klang Valley, Johor and Penang; legacy nationwide locations and provenance remain unchanged.
+V4 resumes toward 400,000 unique locations. New searches remain focused on Klang Valley, Johor and Penang, with a small GDP-ranked pilot in Perak, Pahang, Kedah, Negeri Sembilan and Melaka; legacy nationwide locations and provenance remain unchanged.
 
 ## 4. Optional automatic restart after sign-in
 

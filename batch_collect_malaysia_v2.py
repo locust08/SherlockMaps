@@ -193,6 +193,30 @@ PRIMARY_MARKET_LOCALITIES: list[tuple[str, str]] = [
     ("Kepala Batas", "Penang"), ("Nibong Tebal", "Penang"),
 ]
 
+# DOSM 2025 real GDP, RM billions. The established conversion markets remain
+# primary; this small Peninsular pilot is ordered by total GDP, not GDP/capita.
+PENINSULAR_EXPANSION_GDP_2025: tuple[tuple[str, float], ...] = (
+    ("Perak", 91.5), ("Pahang", 71.0), ("Kedah", 56.3),
+    ("Negeri Sembilan", 55.8), ("Melaka", 50.3),
+)
+PENINSULAR_PILOT_LOCALITIES: dict[str, tuple[str, ...]] = {
+    "Perak": ("Ipoh", "Taiping"),
+    "Pahang": ("Kuantan", "Temerloh"),
+    "Kedah": ("Alor Setar", "Sungai Petani", "Kulim"),
+    "Negeri Sembilan": ("Seremban", "Nilai"),
+    "Melaka": ("Melaka City", "Alor Gajah"),
+}
+PENINSULAR_PILOT_TERMS: tuple[tuple[str, str], ...] = (
+    ("Health, Fitness & Wellness", "dental clinic"),
+    ("Health, Fitness & Wellness", "medical clinic"),
+    ("Home Improvement", "renovation contractor"),
+    ("Pest & Cleaning", "commercial cleaning"),
+    ("Automotive", "car workshop"),
+    ("Finance", "accounting firm"),
+    ("Industrial & Manufacturing", "industrial supplier"),
+    ("Interior Design", "interior designer"),
+)
+
 CLASSIFICATION_ONLY_INDUSTRIES = ("Government", "Others")
 
 # Lower values run first. Previously covered Education/Home categories remain
@@ -539,6 +563,8 @@ def setup_logging() -> None:
 def market_name(state: str) -> str:
     if state in {"Selangor", "Federal Territory"}:
         return "Klang Valley"
+    if state in PENINSULAR_PILOT_LOCALITIES:
+        return "Peninsular Expansion"
     return state
 
 
@@ -678,13 +704,31 @@ def rank_market_tasks(tasks: list[QueryTask]) -> list[QueryTask]:
     return ranked
 
 
+def rank_peninsular_expansion(tasks: list[QueryTask]) -> list[QueryTask]:
+    """Interleave pilot states in proportion to GDP while learning local yield."""
+    grouped = {
+        state: deque(rank_market_tasks([task for task in tasks if task.state == state]))
+        for state, _ in PENINSULAR_EXPANSION_GDP_2025
+    }
+    cycle = ["Perak"] * 5 + ["Pahang"] * 4 + ["Kedah"] * 3 + ["Negeri Sembilan"] * 3 + ["Melaka"] * 3
+    ordered: list[QueryTask] = []
+    while any(grouped.values()):
+        for state in cycle:
+            if grouped[state]:
+                ordered.append(grouped[state].popleft())
+    return ordered
+
+
 def weighted_market_order(tasks: list[QueryTask]) -> list[QueryTask]:
-    """Interleave tasks at 55% Klang Valley, 25% Johor, and 20% Penang."""
-    group_lists: dict[str, list[QueryTask]] = {name: [] for name in ("Klang Valley", "Johor", "Penang")}
+    """Keep core markets dominant while sampling GDP-ranked Peninsular states."""
+    group_lists: dict[str, list[QueryTask]] = {name: [] for name in (
+        "Klang Valley", "Johor", "Penang", "Peninsular Expansion",
+    )}
     for task in tasks:
         group_lists.setdefault(market_name(task.state), []).append(task)
-    groups = {name: deque(rank_market_tasks(group)) for name, group in group_lists.items()}
-    cycle = ["Klang Valley"] * 11 + ["Johor"] * 5 + ["Penang"] * 4
+    groups = {name: deque(rank_peninsular_expansion(group) if name == "Peninsular Expansion"
+                          else rank_market_tasks(group)) for name, group in group_lists.items()}
+    cycle = ["Klang Valley"] * 11 + ["Johor"] * 5 + ["Penang"] * 4 + ["Peninsular Expansion"] * 3
     ordered: list[QueryTask] = []
     while any(groups.get(name) for name in cycle):
         progressed = False
@@ -712,6 +756,18 @@ def build_manifest(conn: sqlite3.Connection | None = None) -> list[QueryTask]:
         for sector, base_terms in SECTOR_TERMS.items():
             terms = list(dict.fromkeys(base_terms + V4_EXTRA_TERMS.get(sector, [])))
             for term in terms:
+                prompt = f"{term} in {locality}, {state}, Malaysia"
+                if prompt in completed_prompts:
+                    continue
+                bucket, priority = strategy_for(sector, term)
+                tasks.append(QueryTask(
+                    prompt=prompt, sector=sector, locality=locality, state=state, term=term,
+                    geo_level="city", priority=priority, strategy_bucket=bucket,
+                    expected_ab_yield=estimate(sector, term),
+                ))
+    for state, _ in PENINSULAR_EXPANSION_GDP_2025:
+        for locality in PENINSULAR_PILOT_LOCALITIES[state]:
+            for sector, term in PENINSULAR_PILOT_TERMS:
                 prompt = f"{term} in {locality}, {state}, Malaysia"
                 if prompt in completed_prompts:
                     continue
@@ -1225,7 +1281,9 @@ def write_status(
         "eta_hours": eta, "pilot_status": pilot_status, "job_status_counts": jobs,
         "lead_rank_counts": lead_ranks, "primary_offer_counts": offers,
         "primary_markets": ["Klang Valley", "Johor", "Penang"],
-        "market_query_allocation": {"Klang Valley": 55, "Johor": 25, "Penang": 20},
+        "expansion_states_gdp_2025_rm_bn": dict(PENINSULAR_EXPANSION_GDP_2025),
+        "market_query_allocation": {"Klang Valley": 48, "Johor": 22, "Penang": 17,
+                                    "Peninsular Expansion": 13},
         "uptime_seconds": int(time.time() - started_at), "halt_reason": halt_reason,
         "database": str(DB_PATH),
     }, indent=2)

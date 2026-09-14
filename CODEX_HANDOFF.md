@@ -6,9 +6,17 @@ This is a local, crash-safe lead-intelligence system for LOCUS-T Malaysia. It di
 
 The completion target is **400,000 qualified unique physical locations**, not raw results. Existing nationwide data remains append-only. New V4 collection is deliberately concentrated where LOCUS-T expects higher conversion value and can meet prospects more easily:
 
-- Klang Valley: 55% of new query scheduling.
-- Johor: 25%.
-- Penang: 20%.
+- Klang Valley: about 48% of new query scheduling while the pilot is available.
+- Johor: about 22%.
+- Penang: about 17%.
+- GDP-ranked Peninsular pilot: about 13%, initially Perak, Pahang, Kedah,
+  Negeri Sembilan, then Melaka. These are ranked by 2025 **total** real GDP,
+  not GDP per capita, using the [official DOSM state release](https://www.dosm.gov.my/portal-main/release-content/gross-domestic-product-gdp-by-state-2025).
+
+The pilot uses a small set of high-intent searches in two or three cities per
+state. Keep the core markets dominant; expand a pilot state further only after
+its observed unique and A/B lead yield justifies it. The live two-hour Codex
+monitor compares performance and reports material changes or failures.
 
 Always read live counts from `data/malaysia_batch_status.json` or [http://localhost:8765/](http://localhost:8765/); counts in messages or documents become stale.
 

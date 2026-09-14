@@ -309,7 +309,9 @@ def read_dashboard_data() -> dict:
     markets = conn.execute(
         """SELECT CASE WHEN c.state_name IN ('Selangor','Federal Territory') THEN 'Klang Valley'
                     WHEN c.state_name='Johor' THEN 'Johor'
-                    WHEN c.state_name='Penang' THEN 'Penang' ELSE 'Other (legacy)' END market,
+                    WHEN c.state_name='Penang' THEN 'Penang'
+                    WHEN c.state_name IN ('Perak','Pahang','Kedah','Negeri Sembilan','Melaka')
+                      THEN 'Peninsular Expansion' ELSE 'Other (legacy)' END market,
                   COUNT(*),SUM(CASE WHEN li.sales_rank IN ('A','B') THEN 1 ELSE 0 END)
            FROM companies c LEFT JOIN lead_intelligence li
              ON li.company_id=c.id AND li.intelligence_version=4
@@ -402,7 +404,7 @@ def dashboard_page(data: dict) -> str:
     ram_class = "good" if ram_state == "healthy" else "bad" if ram_state == "critical" else "warn"
     return f"""<!doctype html><html><head><meta charset='utf-8'>
     <title>LOCUS-T Lead Intelligence V4</title><style>{CSS}</style></head><body>
-    <header><h1>LOCUS-T Lead Intelligence V4</h1>{navigation('dashboard')}<p>400,000 sales-ready Malaysian locations · focus: Klang Valley 55%, Johor 25%, Penang 20%</p>
+    <header><h1>LOCUS-T Lead Intelligence V4</h1>{navigation('dashboard')}<p>400,000 qualified Malaysian locations · focus: Klang Valley, Johor and Penang (87%); GDP-ranked Peninsular pilot (13%)</p>
     <div class='status-strip'>
       <span>Dashboard refreshed: <strong id='dashboard-refresh'>--</strong></span>
       <span><i id='heartbeat-dot' class='dot {state_class}'></i>Collector updated: <strong id='collector-update'>--</strong> (<span id='heartbeat-age'>--</span>)</span>
@@ -726,7 +728,9 @@ def pipeline_page(message: str = "") -> str:
 def coverage_page() -> str:
     conn = connection()
     market = conn.execute(
-        """SELECT CASE WHEN state IN ('Selangor','Federal Territory') THEN 'Klang Valley' ELSE state END,
+        """SELECT CASE WHEN state IN ('Selangor','Federal Territory') THEN 'Klang Valley'
+                         WHEN state IN ('Perak','Pahang','Kedah','Negeri Sembilan','Melaka')
+                           THEN 'Peninsular Expansion' ELSE state END,
                   COUNT(*),SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
                   SUM(qualified_new),SUM(ab_leads_new),ROUND(AVG(expected_ab_yield),2)
            FROM search_jobs WHERE taxonomy_version=4 GROUP BY 1 ORDER BY COUNT(*) DESC"""
@@ -744,14 +748,15 @@ def coverage_page() -> str:
            FROM companies c LEFT JOIN company_industry_classification ic
              ON ic.company_id=c.id AND ic.taxonomy_version=4
            LEFT JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
-           WHERE c.state_name IN ('Selangor','Federal Territory','Johor','Penang')
+           WHERE c.state_name IN ('Selangor','Federal Territory','Johor','Penang',
+                                  'Perak','Pahang','Kedah','Negeri Sembilan','Melaka')
            GROUP BY c.state_name,2 ORDER BY c.state_name,COUNT(*) DESC"""
     ).fetchall()
     conn.close()
-    body = f"""<p>New V4 search allocation: 55% Klang Valley, 25% Johor, 20% Penang. Legacy nationwide data remains available but is not prioritized.</p>
+    body = f"""<p>New V4 query allocation while pilot work is available: about 48% Klang Valley, 22% Johor, 17% Penang, and 13% GDP-ranked Peninsular expansion. Older nationwide records remain available.</p>
       <h2>Query allocation and results</h2>{table(['Market','Queries','Completed','Qualified','A/B leads','Expected A/B'],market)}
       <h2>A/B yield by industry and strategy</h2>{table(['Industry','Strategy','Queries','Completed','Qualified','A/B leads','Expected A/B','Duplicate %'],yield_rows)}
-      <h2>Lead coverage in primary markets</h2>{table(['State','Industry','Locations','A/B leads'],coverage)}"""
+      <h2>Lead coverage in core and pilot markets</h2>{table(['State','Industry','Locations','A/B leads'],coverage)}"""
     return page("Coverage and query yield", body, "coverage")
 
 

@@ -385,3 +385,18 @@ English/Malay extraction and its waits alongside grouped contact rollout.
 - These changes passed 55 local unit/integration tests. The claimed doubling
   of qualified leads per hour is a target, not yet a measured result; compare
   equal rolling windows after enough post-restart queries finish.
+
+### 14 September 2026: Peninsular expansion pilot
+
+- A two-hour Codex monitor checks live collector health and compares recent
+  query and lead yield with the preceding two-hour window. It stays quiet when
+  nothing actionable changes.
+- A small pilot adds Perak, Pahang, Kedah, Negeri Sembilan and Melaka, ranked by
+  total 2025 real GDP from DOSM (RM91.5b, RM71.0b, RM56.3b, RM55.8b and
+  RM50.3b respectively). This GDP signal orders cold-start exploration; actual
+  A/B leads per query-hour continue to decide deeper expansion.
+- While pilot jobs remain, roughly 87% of query slots still go to Klang Valley,
+  Johor and Penang. The other roughly 13% sample high-intent searches in two or
+  three cities per pilot state. Existing nationwide data and query history are
+  preserved; lower-GDP Peninsular states remain possible future tests.
+- Source: https://www.dosm.gov.my/portal-main/release-content/gross-domestic-product-gdp-by-state-2025
