@@ -135,18 +135,18 @@ class V3CollectorTests(unittest.TestCase):
                  for state in states for index in range(30)]
         ranked = weighted_market_order(tasks)
         self.assertEqual(MARKET_REORDER_INTERVAL, len(MARKET_ORDER_CYCLE))
-        self.assertEqual(MARKET_REORDER_INTERVAL, 23)
+        self.assertEqual(MARKET_REORDER_INTERVAL, 20)
         first = ranked[:MARKET_REORDER_INTERVAL]
-        self.assertEqual(sum(task.state == "Selangor" for task in first), 11)
-        self.assertEqual(sum(task.state == "Johor" for task in first), 5)
-        self.assertEqual(sum(task.state == "Penang" for task in first), 4)
+        self.assertEqual(sum(task.state == "Selangor" for task in first), 6)
+        self.assertEqual(sum(task.state == "Johor" for task in first), 4)
+        self.assertEqual(sum(task.state == "Penang" for task in first), 2)
         self.assertEqual(sum(task.state not in {"Selangor", "Johor", "Penang"}
-                             for task in first), 3)
+                             for task in first), 8)
         expansion = rank_peninsular_expansion([
             task for task in tasks if task.state in PENINSULAR_PILOT_LOCALITIES
         ])
-        self.assertEqual([task.state for task in expansion[:5]], ["Perak"] * 5)
-        self.assertEqual([task.state for task in expansion[5:9]], ["Pahang"] * 4)
+        self.assertEqual([task.state for task in expansion[:5]],
+                         ["Perak", "Pahang", "Kedah", "Negeri Sembilan", "Melaka"])
 
     def test_website_build_lead_is_accepted(self) -> None:
         reason = persist_observation(self.conn, self.task, {

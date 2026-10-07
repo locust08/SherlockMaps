@@ -152,3 +152,35 @@ If `git push` requests authentication, sign in with Git Credential Manager or us
 ## Next recommended action
 
 Let the 120-query V4 pilot run, then validate a stratified 500-record sample and a 1,000-lead A/B sales pilot. Feed actual contact, qualification, proposal and win outcomes back into query prioritization weekly before scaling outreach.
+
+### October 2026 scope refresh
+
+The original core-market search space became saturated (210 new leads from
+298 queries on 7 October). The active allocation is now 60% core markets and
+40% GDP-ranked expansion in Perak, Pahang, Kedah, Negeri Sembilan and Melaka.
+Expanded towns and commercial terms are declared in `batch_collect_malaysia_v2.py`.
+Recent 72-hour exact-group yield overrides historical state/term estimates.
+Groups whose latest three completed searches have zero new A/B leads or each
+exceed 80% duplicates remain pending but are temporarily excluded for 72 hours.
+Legacy sibling skips, original classifications and deduplication remain intact.
+
+`metadata.scope_refresh_canary_20261007` persists the first 60 submitted queries,
+outcomes and new-location count across restarts. `/api/status` and the dashboard
+show its progress. It passes at >=8 unique new locations/query, <5% technical
+failures, and no persistent Google block. A failed canary stops automatic
+expansion and the watchdog respects that review gate; inspect evidence before
+changing the gate. Do not delete historical jobs or reset the canary blindly.
+
+The watchdog no longer starts website enrichment every five minutes. Its existing
+queue is retained. Run a controlled batch only during a planned collector pause:
+
+```powershell
+Disable-ScheduledTask -TaskName 'SherlockMaps Malaysia Collector Watchdog'
+# Stop the verified collector process tree, then run at most 500 website audits:
+powershell -ExecutionPolicy Bypass -File automation/run_enrichment_batch.ps1 -Limit 100
+Enable-ScheduledTask -TaskName 'SherlockMaps Malaysia Collector Watchdog'
+powershell -ExecutionPolicy Bypass -File automation/watch_malaysia_collector.ps1
+```
+
+The batch refuses to run while a collector exists. Resume through the watchdog
+after the batch ends. SQLite backups must be transferred privately, not via Git.

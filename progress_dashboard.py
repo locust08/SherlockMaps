@@ -402,9 +402,10 @@ def dashboard_page(data: dict) -> str:
     maximum_workers = int(status.get("maximum_workers", 4) or 4)
     ram_state = str(status.get("ram_operating_state", "unknown"))
     ram_class = "good" if ram_state == "healthy" else "bad" if ram_state == "critical" else "warn"
+    scope_canary = status.get('scope_canary') or {}
     return f"""<!doctype html><html><head><meta charset='utf-8'>
     <title>LOCUS-T Lead Intelligence V4</title><style>{CSS}</style></head><body>
-    <header><h1>LOCUS-T Lead Intelligence V4</h1>{navigation('dashboard')}<p>400,000 qualified Malaysian locations · focus: Klang Valley, Johor and Penang (87%); GDP-ranked Peninsular pilot (13%)</p>
+    <header><h1>LOCUS-T Lead Intelligence V4</h1>{navigation('dashboard')}<p>400,000 qualified Malaysian locations · Klang Valley, Johor and Penang (60%); fresh Peninsular expansion (40%)</p>
     <div class='status-strip'>
       <span>Dashboard refreshed: <strong id='dashboard-refresh'>--</strong></span>
       <span><i id='heartbeat-dot' class='dot {state_class}'></i>Collector updated: <strong id='collector-update'>--</strong> (<span id='heartbeat-age'>--</span>)</span>
@@ -423,6 +424,7 @@ def dashboard_page(data: dict) -> str:
       <div class='card'><div class='label'>RAM operating state</div><div class='value {ram_class}'>{esc(ram_state.title())}</div><div class='small'>{esc(status.get('available_ram_gb','?'))} GB free · {esc(status.get('reserved_ram_gb',2))} GB reserved · {esc(status.get('ram_policy_mode','balanced'))} mode</div></div>
       <div class='card'><div class='label'>Memory recoveries</div><div class='value'>{int(status.get('reclaimed_jobs',0)):,}</div><div class='small'>{int(status.get('memory_pressure_pauses',0)):,} pauses · lowest {esc(status.get('lowest_available_ram_gb','?'))} GB at {esc(status.get('lowest_available_ram_at') or 'n/a')}</div></div>
       <div class='card'><div class='label'>Renderer recycling</div><div class='value'>{int(status.get('page_recycle_count',0)):,}</div><div class='small'>{int(status.get('memory_cleanup_count',0)):,} in-feed cleanups · context every 10 details</div></div>
+      <div class='card'><div class='label'>Fresh-location canary</div><div class='value'>{esc(scope_canary.get('status','pending'))}</div><div class='small'>{int(scope_canary.get('completed',0))} / 60 completed · {int(scope_canary.get('qualified_new',0))} new leads · {int(scope_canary.get('failures',0))} technical failures</div></div>
     </div>
     <div class='bar'><span style='width:{progress:.2f}%'></span></div>
     <div class='label'>Updated: {esc(status.get('updated_at'))} · {esc(status.get('halt_reason') or 'No halt reason')}</div>
