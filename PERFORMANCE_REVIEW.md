@@ -427,3 +427,37 @@ English/Malay extraction and its waits alongside grouped contact rollout.
   repeatedly postpone Penang and expansion searches. Re-ranking now waits
   for a complete 23-query rotation. This preserves the existing geography
   weights and changes no source data or qualification rules.
+
+### 7 October 2026: fresh-state supply and reversible saturation pauses
+
+- Baseline: 283,266 locations; 210 new companies from 298 completed searches
+  in 24 hours (8.75/hour, 0.70/query). Of 17,744 processed listings, 10,338
+  were duplicates and 7,196 were rejected. Only three browsers could run at
+  the initial check because free RAM was 0.37 GB; nine storage-lock errors
+  had occurred since the current collector start.
+- The initial expansion pilot had exhausted its queue. Historical V4 new
+  locations/query: Pahang 26.23, Kedah 25.63, Melaka 19.37, Negeri Sembilan
+  17.14, Perak 7.87. Added towns and proven automotive, healthcare, industrial,
+  renovation, accounting, construction and cleaning terms in these states.
+- The temporary market rotation is 30% Klang Valley, 20% Johor, 10% Penang,
+  40% GDP-ordered Peninsular expansion. The expansion states are interleaved
+  within each rotation. Finished/skipped jobs are excluded before allocating
+  market slots, fixing a second source of allocation distortion.
+- Exact group speed uses the past 72 hours. Historical state/term speed is a
+  capped cold-start estimate. Groups pause when their latest three recent
+  searches add zero A/B leads or each exceed 80% duplicates; their jobs stay
+  pending, and the pause expires after 72 hours without fresh evidence.
+- The watchdog no longer continuously launches website enrichment. Audits
+  remain queued; `automation/run_enrichment_batch.ps1` runs a bounded batch
+  only while the collector/watchdog are paused.
+- A persisted 60-query canary counts distinct qualified new company IDs using
+  first-seen time and provenance, including crash-safe retry discoveries. It
+  requires >=8 new locations/query, <5% normal technical failures and no
+  persistent Google block. Memory and storage requeues do not consume this
+  failure budget. If it fails, collector restart is suppressed pending review.
+- A consistent 4.71 GB backup passed SQLite quick_check at 283,272 companies.
+  Dry-run source/company-field and completed-history checksums matched before
+  and after queue registration. The generated runnable queue has 6,029 jobs,
+  including 821 expansion jobs; its first 20 slots verified the 60/40 split.
+  All 64 tests passed. The collector resumed with the canary running; its
+  throughput improvement is not yet established.

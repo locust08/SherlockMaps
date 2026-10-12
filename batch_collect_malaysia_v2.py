@@ -207,11 +207,11 @@ PENINSULAR_EXPANSION_GDP_2025: tuple[tuple[str, float], ...] = (
     ("Negeri Sembilan", 55.8), ("Melaka", 50.3),
 )
 PENINSULAR_PILOT_LOCALITIES: dict[str, tuple[str, ...]] = {
-    "Perak": ("Ipoh", "Taiping"),
-    "Pahang": ("Kuantan", "Temerloh"),
-    "Kedah": ("Alor Setar", "Sungai Petani", "Kulim"),
-    "Negeri Sembilan": ("Seremban", "Nilai"),
-    "Melaka": ("Melaka City", "Alor Gajah"),
+    "Perak": ("Ipoh", "Taiping", "Manjung", "Teluk Intan", "Batu Gajah", "Kuala Kangsar", "Kampar", "Sitiawan"),
+    "Pahang": ("Kuantan", "Temerloh", "Bentong", "Raub", "Mentakab", "Maran", "Pekan", "Jerantut", "Gambang"),
+    "Kedah": ("Alor Setar", "Sungai Petani", "Kulim", "Jitra", "Gurun", "Pendang", "Baling", "Pokok Sena", "Langkawi"),
+    "Negeri Sembilan": ("Seremban", "Nilai", "Port Dickson", "Kuala Pilah", "Senawang", "Bahau", "Tampin", "Rembau", "Mantin"),
+    "Melaka": ("Melaka City", "Alor Gajah", "Jasin", "Ayer Keroh", "Batu Berendam", "Cheng", "Merlimau", "Masjid Tanah"),
 }
 PENINSULAR_PILOT_TERMS: tuple[tuple[str, str], ...] = (
     ("Health, Fitness & Wellness", "dental clinic"),
@@ -222,13 +222,29 @@ PENINSULAR_PILOT_TERMS: tuple[tuple[str, str], ...] = (
     ("Finance", "accounting firm"),
     ("Industrial & Manufacturing", "industrial supplier"),
     ("Interior Design", "interior designer"),
+    ("Automotive", "car repair"),
+    ("Automotive", "tyre shop"),
+    ("Automotive", "bengkel kereta"),
+    ("Health, Fitness & Wellness", "klinik gigi"),
+    ("Health, Fitness & Wellness", "klinik perubatan"),
+    ("Home Improvement", "air conditioner service"),
+    ("Home Improvement", "electrical contractor"),
+    ("Home Improvement", "kontraktor renovasi"),
+    ("Construction", "construction company"),
+    ("Construction", "building materials supplier"),
+    ("Industrial & Manufacturing", "manufacturer"),
+    ("Industrial & Manufacturing", "machinery supplier"),
+    ("Finance", "tax consultant"),
+    ("Pest & Cleaning", "office cleaning service"),
 )
 
 # A queue refresh must let the full market rotation run first; refreshing after
 # ten completions repeatedly moved Penang and the GDP pilot behind core markets.
-MARKET_ORDER_CYCLE = (("Klang Valley",) * 11 + ("Johor",) * 5 +
-                      ("Penang",) * 4 + ("Peninsular Expansion",) * 3)
+MARKET_ORDER_CYCLE = (("Klang Valley",) * 6 + ("Johor",) * 4 +
+                      ("Penang",) * 2 + ("Peninsular Expansion",) * 8)
 MARKET_REORDER_INTERVAL = len(MARKET_ORDER_CYCLE)
+SCOPE_CANARY_KEY = "scope_refresh_canary_20261007"
+SCOPE_CANARY_QUERIES = 60
 
 CLASSIFICATION_ONLY_INDUSTRIES = ("Government", "Others")
 
@@ -674,7 +690,20 @@ def observed_ab_hourly_rates(conn: sqlite3.Connection | None) -> dict[tuple[str,
     """Recent sales-ready lead speed by term, state and location granularity."""
     if conn is None:
         return {}
-    return {
+    # Historical state/term performance is a cold-start estimate only. Recent
+    # exact-granularity measurements always override it, including zero yield.
+    rates = {
+        (str(sector), str(term), str(state), "*"): min(60.0, round(float(leads) / float(hours), 2))
+        for sector, term, state, leads, hours in conn.execute(
+            """SELECT sector,term,state,
+                      SUM(MAX(0,MIN(COALESCE(ab_leads_new,0),COALESCE(qualified_new,0)))),
+                      SUM(MAX(1.0/60.0,(julianday(completed_at)-julianday(started_at))*24.0))
+               FROM search_jobs WHERE taxonomy_version=4 AND status='completed'
+                 AND started_at IS NOT NULL AND completed_at IS NOT NULL
+               GROUP BY sector,term,state HAVING COUNT(*)>=3"""
+        ) if hours and hours > 0
+    }
+    rates.update({
         (str(sector), str(term), str(state), str(geo_level)): min(200.0, round(float(leads) / float(hours), 2))
         for sector, term, state, geo_level, leads, hours in conn.execute(
             """SELECT sector,term,state,geo_level,
@@ -683,18 +712,20 @@ def observed_ab_hourly_rates(conn: sqlite3.Connection | None) -> dict[tuple[str,
                FROM search_jobs
                WHERE taxonomy_version=4 AND status='completed'
                  AND started_at IS NOT NULL AND completed_at IS NOT NULL
-                 AND julianday(completed_at)>=julianday('now','-14 days')
+                 AND julianday(completed_at)>=julianday('now','-72 hours')
                GROUP BY sector,term,state,geo_level
                HAVING COUNT(*)>=3 AND
                       SUM(MAX(1.0/60.0,(julianday(completed_at)-julianday(started_at))*24.0))>=0.25"""
         ) if hours and hours > 0
-    }
+    })
+    return rates
 
 
 def with_expected_speed(tasks: list[QueryTask], rates: dict[tuple[str, str, str, str], float]) -> list[QueryTask]:
     return [replace(task, expected_ab_per_hour=rates.get(
         (task.sector, task.term, task.state, task.geo_level),
-        min(UNSAMPLED_AB_RATE_CAP, task.expected_ab_yield * UNSAMPLED_AB_RATE_MULTIPLIER),
+        rates.get((task.sector, task.term, task.state, "*"),
+                  min(UNSAMPLED_AB_RATE_CAP, task.expected_ab_yield * UNSAMPLED_AB_RATE_MULTIPLIER)),
     )) for task in tasks]
 
 
@@ -723,7 +754,9 @@ def rank_peninsular_expansion(tasks: list[QueryTask]) -> list[QueryTask]:
         state: deque(rank_market_tasks([task for task in tasks if task.state == state]))
         for state, _ in PENINSULAR_EXPANSION_GDP_2025
     }
-    cycle = ["Perak"] * 5 + ["Pahang"] * 4 + ["Kedah"] * 3 + ["Negeri Sembilan"] * 3 + ["Melaka"] * 3
+    # Round-robin the GDP-weighted slots rather than putting one state first
+    # on every refresh, which previously starved the smaller pilot states.
+    cycle = ["Perak", "Pahang", "Kedah", "Negeri Sembilan", "Melaka"] * 3 + ["Perak", "Pahang", "Perak"]
     ordered: list[QueryTask] = []
     while any(grouped.values()):
         for state in cycle:
@@ -851,7 +884,14 @@ def build_manifest(conn: sqlite3.Connection | None = None, selection: dict | Non
             if len(existing_prompts) >= 15_500:
                 break
     unique = {task.prompt: task for task in tasks}
-    return weighted_market_order(with_expected_speed(list(unique.values()), observed_ab_hourly_rates(conn)))
+    pauses = paused_query_groups(conn) if conn is not None else set()
+    finished_prompts = completed_prompts | ({row[0] for row in conn.execute(
+        "SELECT prompt FROM search_jobs WHERE taxonomy_version=4 AND status='skipped'")}
+        if conn is not None else set())
+    candidates = [task for task in unique.values()
+                  if (task.sector, task.term, task.state, task.geo_level) not in pauses
+                  and task.locality != "Labuan" and task.prompt not in finished_prompts]
+    return weighted_market_order(with_expected_speed(candidates, observed_ab_hourly_rates(conn)))
 
 
 def expand_task(task: QueryTask) -> list[QueryTask]:
@@ -1271,6 +1311,11 @@ def write_status(
     eta = round((target - count) / rate, 1) if rate > 0 and count < target else None
     ram = available_memory_gb()
     diagnostics = diagnostics or {}
+    from collection_selection import load_selection
+    selection_mode = load_selection(DB_PATH)['mode']
+    canary_row = conn.execute('SELECT value FROM metadata WHERE key=?', (SCOPE_CANARY_KEY,)).fetchone()
+    effective_canary = (json.loads(canary_row[0]) if canary_row else None) if selection_mode == 'default' else {
+        'status': 'not_applicable', 'prompts': []}
     payload = json.dumps({
         "updated_at": utc_now(), "collector_version": COLLECTOR_VERSION,
         "target_qualified_companies": target, "qualified_companies": count,
@@ -1307,14 +1352,69 @@ def write_status(
         "lead_rank_counts": lead_ranks, "primary_offer_counts": offers,
         "primary_markets": ["Klang Valley", "Johor", "Penang"],
         "expansion_states_gdp_2025_rm_bn": dict(PENINSULAR_EXPANSION_GDP_2025),
-        "market_query_allocation": {"Klang Valley": 48, "Johor": 22, "Penang": 17,
-                                    "Peninsular Expansion": 13},
+        "market_query_allocation": {"Klang Valley": 30, "Johor": 20, "Penang": 10,
+                                    "Peninsular Expansion": 40},
+        "scope_canary": effective_canary,
+        "selection_mode": selection_mode,
         "uptime_seconds": int(time.time() - started_at), "halt_reason": halt_reason,
         "database": str(DB_PATH),
     }, indent=2)
     temporary_status = STATUS_PATH.with_suffix(".json.tmp")
     temporary_status.write_text(payload, encoding="utf-8")
     os.replace(temporary_status, STATUS_PATH)
+
+
+def paused_query_groups(conn: sqlite3.Connection) -> set[tuple[str, str, str, str]]:
+    """Pause only recent exhausted groups; keep their jobs pending for later."""
+    return {tuple(row[:4]) for row in conn.execute(
+        """WITH recent AS (
+           SELECT sector,term,state,geo_level,ab_leads_new,qualified_new,
+                  duplicate_count,processed_count,
+                  ROW_NUMBER() OVER (PARTITION BY sector,term,state,geo_level
+                                     ORDER BY julianday(completed_at) DESC,prompt) AS rn
+           FROM search_jobs WHERE taxonomy_version=4 AND status='completed'
+             AND julianday(completed_at)>=julianday('now','-72 hours'))
+           SELECT sector,term,state,geo_level FROM recent WHERE rn<=3
+           GROUP BY sector,term,state,geo_level HAVING COUNT(*)=3 AND
+             (SUM(MAX(0,MIN(COALESCE(ab_leads_new,0),qualified_new)))=0 OR
+              MIN(CASE WHEN processed_count>0 AND
+                  duplicate_count*1.0/processed_count>0.8 THEN 1 ELSE 0 END)=1)"""
+    )}
+
+
+def assess_scope_canary(completed: int, new: int, failures: int,
+                       attempts: int, persistently_blocked: bool) -> str:
+    if completed < SCOPE_CANARY_QUERIES:
+        return "running"
+    return "passed" if (new / completed >= 8 and failures / max(1, attempts) < .05
+                         and not persistently_blocked) else "needs_review"
+
+
+def update_scope_canary(conn: sqlite3.Connection, state: dict[str, Any],
+                        persistently_blocked: bool = False) -> None:
+    needs_review = state["status"] == "needs_review"
+    state["persistently_blocked"] = bool(state.get("persistently_blocked") or persistently_blocked)
+    prompts = state["prompts"]
+    if prompts:
+        slots = ','.join('?' for _ in prompts)
+        completed, terminal_failures = conn.execute(
+            f"""SELECT SUM(status='completed'),SUM(status='failed' AND attempts>=?)
+                FROM search_jobs WHERE taxonomy_version=4 AND prompt IN ({slots})""",
+            (MAX_ATTEMPTS, *prompts),
+        ).fetchone()
+        new = conn.execute(
+            f"""SELECT COUNT(DISTINCT c.id) FROM companies c JOIN provenance p ON p.company_id=c.id
+                WHERE p.prompt IN ({slots}) AND julianday(c.first_seen_at)>=julianday(?)""",
+            (*prompts, state["started_at"]),
+        ).fetchone()[0]
+        state.update(completed=int(completed or 0), terminal_failures=int(terminal_failures or 0),
+                     qualified_new=int(new))
+        state["status"] = "needs_review" if needs_review else assess_scope_canary(
+            state["completed"] + state["terminal_failures"], int(new),
+            state["failures"], state["attempts"], state["persistently_blocked"])
+    conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)",
+                 (SCOPE_CANARY_KEY, json.dumps(state)))
+    conn.commit()
 
 
 def low_yield_siblings(conn: sqlite3.Connection, task: QueryTask) -> bool:
@@ -1413,6 +1513,22 @@ def _run_batch(args: argparse.Namespace) -> int:
         conn.close()
         return 0
     count = qualified_count(conn)
+    previous_canary = conn.execute("SELECT value FROM metadata WHERE key=?", (SCOPE_CANARY_KEY,)).fetchone()
+    scope_canary = json.loads(previous_canary[0]) if previous_canary else {
+        "started_at": utc_now(), "status": "running", "prompts": [],
+        "attempts": 0, "failures": 0, "completed": 0, "qualified_new": 0,
+    }
+    if selection['mode'] == 'default':
+        update_scope_canary(conn, scope_canary)
+    else:
+        # The persisted canary belongs to the broad expansion plan. A selected
+        # campaign must neither resume its foreign prompts nor change its gate.
+        scope_canary = {'status': 'not_applicable', 'prompts': []}
+    if scope_canary["status"] == "needs_review":
+        write_status(conn, args.target, 0, started_at,
+                     halt_reason="Scope refresh canary needs review; automatic expansion paused.", worker_limit=0)
+        conn.close()
+        return 2
     if count >= args.target:
         write_status(conn, args.target, 0, started_at, worker_limit=0,
                      diagnostics={'preferred_workers': args.workers, 'maximum_workers': args.max_workers})
@@ -1426,6 +1542,17 @@ def _run_batch(args: argparse.Namespace) -> int:
         "SELECT status FROM search_jobs WHERE taxonomy_version=? AND prompt=?",
         (task.taxonomy_version, task.prompt),
     ).fetchone()[0] in {"pending", "failed"})
+    # A canary retry must remain eligible even if its group was paused after
+    # another job completed, including after an interrupted collector restart.
+    for prompt in scope_canary["prompts"]:
+        if prompt not in {task.prompt for task in pending}:
+            row = conn.execute("""SELECT sector,locality,state,term,geo_level,parent_prompt,priority,status
+                                  FROM search_jobs WHERE taxonomy_version=4 AND prompt=?""", (prompt,)).fetchone()
+            if row and row[7] in {"pending", "failed"}:
+                pending.append(QueryTask(prompt, *row[:5], parent_prompt=row[5] or "", priority=row[6],
+                                         initial_results=args.initial_results, adaptive_results=args.adaptive_results,
+                                         hard_result_cap=args.hard_result_cap, scroll_timeout=args.scroll_timeout))
+    paused_groups = paused_query_groups(conn)
     active: dict[concurrent.futures.Future[CrawlOutcome], QueryTask] = {}
     outcomes: deque[tuple[float, int]] = deque(maxlen=20)
     throttle_times: deque[float] = deque()
@@ -1511,14 +1638,23 @@ def _run_batch(args: argparse.Namespace) -> int:
             while (pending and len(active) < effective_limit and count < args.target
                    and not pause_path(DB_PATH).exists()
                    and submission_allowed(ram, time.time(), cooldown_until)):
-                task = pending.popleft()
+                if scope_canary["status"] == "running" and len(scope_canary["prompts"]) >= SCOPE_CANARY_QUERIES:
+                    task = next((item for item in pending if item.prompt in scope_canary["prompts"]), None)
+                    if task is None:
+                        break
+                    pending.remove(task)
+                else:
+                    task = pending.popleft()
                 row = conn.execute(
                     "SELECT status,attempts FROM search_jobs WHERE taxonomy_version=? AND prompt=?",
                     (TAXONOMY_VERSION, task.prompt),
                 ).fetchone()
                 if row and row[0] == "completed":
                     continue
-                if low_yield_siblings(conn, task):
+                assigned_canary = task.prompt in scope_canary["prompts"]
+                if not assigned_canary and (task.sector, task.term, task.state, task.geo_level) in paused_groups:
+                    continue  # Retain pending status; the 72-hour pause expires.
+                if not assigned_canary and low_yield_siblings(conn, task):
                     conn.execute(
                         "UPDATE search_jobs SET status='skipped',error='Two sibling variants produced fewer than 3 new leads' WHERE taxonomy_version=? AND prompt=?",
                         (TAXONOMY_VERSION, task.prompt),
@@ -1532,6 +1668,9 @@ def _run_batch(args: argparse.Namespace) -> int:
                     (attempts, utc_now(), f"slot-{len(active)+1}", TAXONOMY_VERSION, task.prompt),
                 )
                 conn.commit()
+                if scope_canary["status"] == "running" and task.prompt not in scope_canary["prompts"]:
+                    scope_canary["prompts"].append(task.prompt)
+                    update_scope_canary(conn, scope_canary)
                 future = executor.submit(crawl_task, task, str(DB_PATH))
                 active[future] = task
                 if effective_limit >= 5 and int(diagnostics["ram_canary_completed"]) < RAM_CANARY_QUERIES:
@@ -1648,10 +1787,23 @@ def _run_batch(args: argparse.Namespace) -> int:
                                     pending.append(child)
                                     known.add(child.prompt)
                     if session_completed % MARKET_REORDER_INTERVAL == 0 and pending:
+                        paused_groups = paused_query_groups(conn)
                         pending = deque(weighted_market_order(with_expected_speed(
-                            list(pending), observed_ab_hourly_rates(conn),
+                            [item for item in pending if item.prompt in scope_canary["prompts"] or
+                             (item.sector,item.term,item.state,item.geo_level) not in paused_groups],
+                            observed_ab_hourly_rates(conn),
                         )))
                 conn.commit()
+                if task.prompt in scope_canary["prompts"] and scope_canary["status"] == "running":
+                    if not memory_reclaimed and not storage_locked:
+                        scope_canary["attempts"] += 1
+                        scope_canary["failures"] += int(bool(outcome.error))
+                    update_scope_canary(conn, scope_canary, len(throttle_times) >= 2)
+                    if scope_canary["status"] == "needs_review":
+                        halt_reason = "Scope refresh canary needs review; automatic expansion paused."
+                    elif scope_canary["status"] == "passed":
+                        logging.info("SCOPE CANARY PASSED %s", json.dumps(scope_canary))
+                        record_event(conn, "scope_canary_passed", json.dumps(scope_canary), effective_limit)
                 count = qualified_count(conn)
                 record_checkpoints(conn, count, args.target)
                 if completed_v3 >= PILOT_QUERIES and pilot_status == "running":

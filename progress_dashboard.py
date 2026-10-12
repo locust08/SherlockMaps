@@ -456,6 +456,7 @@ def dashboard_page(data: dict) -> str:
     ram_state = str(status.get("ram_operating_state", "unknown"))
     ram_class = "good" if ram_state == "healthy" else "bad" if ram_state == "critical" else "warn"
     progress_text = '<0.1%' if 0 < progress < .1 else f'{progress:.1f}%'
+    scope_canary = status.get('scope_canary') or {}
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>LOCUS-T Lead Intelligence V4</title><style>{CSS}</style></head><body>
     <header><h1>Collect and review leads</h1>{navigation('dashboard')}<p>Build a lead list, review sales opportunities, then record your team's outcomes.</p>
@@ -550,7 +551,7 @@ def dashboard_page(data: dict) -> str:
       document.getElementById('collector-start').disabled = collectorBusy || collectorActive || !previewReady;
       document.getElementById('scope-lock-notice').hidden = !collectorActive;
       const summary = document.getElementById('campaign-summary');
-      if (!choosing) summary.textContent = 'Broad built-in plan: 26 industries in Klang Valley, Johor and Penang; smaller pilots in Perak, Pahang, Kedah, Negeri Sembilan and Melaka. Successful searches can expand to smaller areas.';
+      if (!choosing) summary.textContent = 'Broad built-in plan: 26 industries; 60% core markets (Klang Valley, Johor and Penang), 40% expansion in Perak, Pahang, Kedah, Negeri Sembilan and Melaka. A 60-query trial checks expansion quality.';
       else {{
         const terms = lines('collector-keywords');
         const industries = terms.length ? terms.join(', ') : selectedValues('collector-industries').join(', ');
@@ -680,6 +681,7 @@ def dashboard_page(data: dict) -> str:
       <div class='card'><div class='label'>Available memory on this device</div><div class='value {ram_class}'>{esc(memory_label(status))}</div><div class='small'>{esc(status.get('memory_source','unavailable'))}. Includes reclaimable memory, not just unused RAM.</div></div>
       <div class='card'><div class='label'>Memory recoveries</div><div class='value'>{int(status.get('reclaimed_jobs',0)):,}</div><div class='small'>{int(status.get('memory_pressure_pauses',0)):,} pauses · historical minimum {esc(status.get('lowest_available_ram_gb') if status.get('lowest_available_ram_gb') is not None else 'unavailable')} GiB</div></div>
       <div class='card'><div class='label'>Renderer recycling</div><div class='value'>{int(status.get('page_recycle_count',0)):,}</div><div class='small'>{int(status.get('memory_cleanup_count',0)):,} in-feed cleanups · context every 10 details</div></div>
+      <div class='card'><div class='label'>Fresh-location canary</div><div class='value'>{esc(scope_canary.get('status','pending'))}</div><div class='small'>{int(scope_canary.get('completed',0))} / 60 completed · {int(scope_canary.get('qualified_new',0))} new leads · {int(scope_canary.get('failures',0))} technical failures</div></div>
     </div><p class='small'>{'An older collector is running without verified cross-platform memory detection. Restart collection when convenient to apply the memory safety fix.' if status.get('collector_memory_legacy') and control['state'] in ('starting','running','pausing') else 'Memory protection uses the measured capacity; unavailable measurements block new browser submissions.'}</p></details>
     <div class='label'>Updated: {esc(status.get('updated_at'))} · {esc(status.get('halt_reason') or 'No halt reason')}</div>
     <h2>Reports and exports</h2>
@@ -1152,7 +1154,7 @@ def coverage_page(started_only: bool = False) -> str:
     conn.close()
     body = f"""<p class='help'>Use this advanced view to understand where searches are planned and which searches produce sales-ready leads. A planned search is not collected coverage.</p>
       <form method='get'><label><input type='checkbox' name='started' value='1' {'checked' if started_only else ''}>Hide groups with no started searches</label><button class='button'>Apply</button></form>
-      <details><summary>Definitions and default search allocation</summary><p>Completed = finished searches. Collected = new locations that passed collection checks. A/B leads = new higher-priority ranked locations, not confirmed prospects. Estimated A/B per search = average predicted yield, not a total or a guarantee. Duplicate rate = duplicate observations divided by processed listings.</p><p>The broad default plan rotates approximately 48% Klang Valley, 22% Johor, 17% Penang and 13% Peninsular pilot searches while pilot work remains. Selected campaigns use your chosen areas instead.</p></details>
+      <details><summary>Definitions and default search allocation</summary><p>Completed = finished searches. Collected = new locations that passed collection checks. A/B leads = new higher-priority ranked locations, not confirmed prospects. Estimated A/B per search = average predicted yield, not a total or a guarantee. Duplicate rate = duplicate observations divided by processed listings.</p><p>The broad default plan rotates approximately 30% Klang Valley, 20% Johor, 10% Penang and 40% Peninsular expansion searches while work remains. Selected campaigns use your chosen areas instead.</p></details>
       <h2>Search plan versus collected results</h2>{table(['Market','Planned searches','Completed','Collected locations','New A/B locations','Estimated A/B per search'],market)}
       <details><summary>Industry and strategy yield</summary>{table(['Industry','Strategy','Planned searches','Completed','Collected locations','New A/B locations','Estimated A/B per search','Duplicate %'],[(sector,friendly(strategy),*values) for sector,strategy,*values in yield_rows])}</details>
       <h2>Collected lead coverage — all states</h2>{table(['State','Industry','Locations','A/B-ranked locations'],coverage)}"""

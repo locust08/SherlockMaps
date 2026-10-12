@@ -25,10 +25,21 @@ if ($running) {
 } elseif (Test-Path $pauseFile) {
     "$(Get-Date -Format o) collector paused by dashboard; not restarting" | Add-Content -Path $watchdogLog
 } else {
-    "$(Get-Date -Format o) starting collector" | Add-Content -Path $watchdogLog
-    Start-Process -FilePath $pythonExe -ArgumentList '-u', $collector `
-        -WorkingDirectory $projectRoot -WindowStyle Hidden `
-        -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog | Out-Null
+    $collectorPaused = $false
+    $statusPath = Join-Path $dataDir 'malaysia_batch_status.json'
+    if (Test-Path -LiteralPath $statusPath) {
+        $savedStatus = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+        if ($savedStatus.scope_canary.status -eq 'needs_review') {
+            "$(Get-Date -Format o) scope canary requires review; collector restart suppressed" | Add-Content -Path $watchdogLog
+            $collectorPaused = $true
+        }
+    }
+    if (-not $collectorPaused) {
+        "$(Get-Date -Format o) starting collector" | Add-Content -Path $watchdogLog
+        Start-Process -FilePath $pythonExe -ArgumentList '-u', $collector `
+            -WorkingDirectory $projectRoot -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog | Out-Null
+    }
 }
 
 $dashboardRunning = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
@@ -55,11 +66,5 @@ if (-not $dashboardHealthy) {
         -RedirectStandardOutput $dashboardStdout -RedirectStandardError $dashboardStderr | Out-Null
 }
 
-$enrichmentRunning = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -match 'website_enrichment\.py' }
-if (-not $enrichmentRunning) {
-    "$(Get-Date -Format o) starting website enrichment batch" | Add-Content -Path $watchdogLog
-    Start-Process -FilePath $pythonExe -ArgumentList 'website_enrichment.py' `
-        -WorkingDirectory $projectRoot -WindowStyle Hidden `
-        -RedirectStandardOutput $enrichmentStdout -RedirectStandardError $enrichmentStderr | Out-Null
-}
+# Enrichment is now an explicit batch, not a competing continuous writer.
+# Run run_enrichment_batch.ps1 while the collector/watchdog are paused.

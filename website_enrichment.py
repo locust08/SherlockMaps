@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import argparse
 import json
 import re
 import sqlite3
@@ -213,4 +214,7 @@ def run(limit: int = 500) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(0 if run() >= 0 else 1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--limit', type=int, default=500)
+    args = parser.parse_args()
+    raise SystemExit(0 if run(limit=args.limit) >= 0 else 1)

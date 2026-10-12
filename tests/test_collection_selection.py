@@ -10,12 +10,46 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 
 import batch_collect_malaysia_v2 as batch
 from collector_control import CollectorController
 
 
 class SelectionTests(unittest.TestCase):
+    def test_default_canary_does_not_resume_foreign_work_or_block_selected_campaign(self):
+        from collection_selection import selection_path
+        selection = dict(self.selection, custom_keywords=['car repair'], custom_industry='Automotive')
+        selection_path(self.db).write_text(json.dumps(selection))
+        conn = batch.open_db(self.db)
+        foreign = batch.QueryTask('dentist in Bangsar, Malaysia', 'Health, Fitness & Wellness',
+                                  'Bangsar', 'Federal Territory', 'dentist')
+        batch.register_manifest(conn, [foreign])
+        for state in ('running', 'needs_review'):
+            canary = dict(started_at=batch.utc_now(), status=state, prompts=[foreign.prompt],
+                          attempts=0, failures=0, completed=0, qualified_new=0)
+            conn.execute('INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)',
+                         (batch.SCOPE_CANARY_KEY, json.dumps(canary)))
+            conn.execute('UPDATE search_jobs SET status="pending"')
+            conn.commit()
+            visited = []
+            def crawl(task, database):
+                visited.append(task.prompt)
+                return batch.CrawlOutcome(task, processed_count=1)
+            args = batch.make_parser().parse_args(['--database', str(self.db), '--target', '10',
+                                                   '--workers', '1', '--max-workers', '1'])
+            with self.subTest(state=state), patch.object(batch, 'crawl_task', side_effect=crawl), \
+                    patch.object(batch, 'available_memory_gb', return_value=8), \
+                    patch.object(batch.concurrent.futures, 'ProcessPoolExecutor', ThreadPoolExecutor):
+                batch.run_batch(args)
+                self.assertEqual(visited, ['car repair in Kota Kinabalu, Sabah, Malaysia'])
+                saved = json.loads(conn.execute('SELECT value FROM metadata WHERE key=?',
+                                                (batch.SCOPE_CANARY_KEY,)).fetchone()[0])
+                self.assertEqual(saved, canary)
+                status = json.loads(self.db.with_suffix('.sqlite.status.json').read_text())
+                self.assertEqual(status['scope_canary']['status'], 'not_applicable')
+        conn.close()
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.db = Path(self.directory.name).resolve() / 'leads.sqlite'
