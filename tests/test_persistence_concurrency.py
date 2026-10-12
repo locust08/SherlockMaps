@@ -3,6 +3,7 @@
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -49,6 +50,47 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(results.count("duplicate_observation"), 7)
         for table in ("companies", "provenance", "raw_observations"):
             self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 1)
+
+    def test_later_crawl_with_place_id_updates_provisional_lead(self):
+        first = dict(self.raw, place_id="", phone="03-1234 5678")
+        self.assertEqual(persist_observation(self.conn, self.task, first), "new")
+        company_id = self.conn.execute("SELECT id FROM companies").fetchone()[0]
+        self.conn.execute("UPDATE sales_leads SET status='CONTACTED',notes='Existing sales history'")
+        self.conn.commit()
+        self.conn.close()
+        self.conn = worker_connection(self.path)
+
+        later_task = replace(self.task, prompt="dental clinic Kuala Lumpur Malaysia")
+        later = dict(self.raw, name="Bangsar Dental Clinic Sdn Bhd",
+                     address="1 Jalan Telawi, Bangsar, Kuala Lumpur, Malaysia",
+                     phone="+60 3 1234 5678")
+        self.assertEqual(persist_observation(self.conn, later_task, later), "duplicate")
+        row = self.conn.execute("SELECT id,maps_place_id,normalized_phone FROM companies").fetchone()
+        self.assertEqual(tuple(row), (company_id, "fixture-place", "+60312345678"))
+        for table in ("companies", "organizations", "lead_intelligence", "sales_leads"):
+            self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM provenance").fetchone()[0], 2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM raw_observations").fetchone()[0], 2)
+        sales = self.conn.execute("SELECT status,notes FROM sales_leads").fetchone()
+        self.assertEqual(tuple(sales), ("CONTACTED", "Existing sales history"))
+
+    def test_competing_crawls_upgrade_one_provisional_location(self):
+        self.assertEqual(persist_observation(self.conn, self.task, dict(self.raw, place_id="")), "new")
+
+        def save(index):
+            connection = worker_connection(self.path)
+            try:
+                task = replace(self.task, prompt=f"dental crawl {index}")
+                raw = dict(self.raw, address="1 Jalan Telawi, Bangsar, Malaysia")
+                return persist_observation(connection, task, raw)
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(save, range(4)))
+        self.assertEqual(results, ["duplicate"] * 4)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM provenance").fetchone()[0], 5)
 
     def test_repeated_observation_does_not_wait_for_writer_or_rescore(self):
         self.assertEqual(persist_observation(self.conn, self.task, self.raw), "new")

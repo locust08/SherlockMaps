@@ -541,7 +541,7 @@ def backfill_v4(conn: sqlite3.Connection, limit: int | None = None) -> int:
     return scored
 
 
-def update_sales_lead(conn: sqlite3.Connection, payload: dict[str, Any], actor: str = "PIC") -> None:
+def update_sales_lead(conn: sqlite3.Connection, payload: dict[str, Any], actor: str = "PIC", *, replace_proposal_value: bool = False) -> None:
     organization_id = int(payload["organization_id"])
     requested_status = normalized(payload.get("status")).upper()
     if requested_status not in SALES_STATUSES:
@@ -553,29 +553,33 @@ def update_sales_lead(conn: sqlite3.Connection, payload: dict[str, Any], actor: 
     if not current:
         raise ValueError(f"Unknown organization {organization_id}")
     old_status, company_id, contact_count = current
-    contacted = requested_status in {"CONTACTED", "QUALIFIED", "DISCOVERY", "PROPOSAL_SENT", "WON", "LOST"}
+    recorded_contact = payload.get('record_contact') is True
+    # Explicit browser contact logging must not reinterpret an assignment or
+    # notes-only save as contact. CSV imports retain their legacy inference.
+    contacted = recorded_contact or ('record_contact' not in payload and requested_status in {"CONTACTED", "QUALIFIED", "DISCOVERY", "PROPOSAL_SENT", "WON", "LOST"})
     now = utc_now()
     fields = {
         "status": requested_status,
         "assigned_pic": payload.get("assigned_pic"),
         "next_action_at": payload.get("next_action_at"),
         "last_contact_at": payload.get("last_contact_at") or (now if contacted else None),
-        "contact_count": int(contact_count or 0) + (1 if contacted and old_status == "NEW" else 0),
+        "contact_count": int(contact_count or 0) + (1 if recorded_contact or contacted and old_status == "NEW" else 0),
         "call_outcome": payload.get("call_outcome"),
         "requirement": payload.get("requirement"),
         "budget_range": payload.get("budget_range"),
-        "proposal_value": float(payload["proposal_value"]) if payload.get("proposal_value") else None,
+        "proposal_value": float(payload["proposal_value"]) if payload.get("proposal_value") is not None and payload.get("proposal_value") != '' else None,
         "proposal_url": payload.get("proposal_url"),
         "lost_reason": payload.get("lost_reason"),
         "notes": payload.get("notes"),
         "updated_at": now,
+        "replace_proposal_value": replace_proposal_value and 'proposal_value' in payload,
     }
     conn.execute(
         """UPDATE sales_leads SET status=:status,assigned_pic=COALESCE(:assigned_pic,assigned_pic),
            next_action_at=COALESCE(:next_action_at,next_action_at),last_contact_at=COALESCE(:last_contact_at,last_contact_at),
            contact_count=:contact_count,call_outcome=COALESCE(:call_outcome,call_outcome),
            requirement=COALESCE(:requirement,requirement),budget_range=COALESCE(:budget_range,budget_range),
-           proposal_value=COALESCE(:proposal_value,proposal_value),proposal_url=COALESCE(:proposal_url,proposal_url),
+           proposal_value=CASE WHEN :replace_proposal_value THEN :proposal_value ELSE COALESCE(:proposal_value,proposal_value) END,proposal_url=COALESCE(:proposal_url,proposal_url),
            lost_reason=COALESCE(:lost_reason,lost_reason),notes=COALESCE(:notes,notes),updated_at=:updated_at
            WHERE organization_id=:organization_id""",
         {**fields, "organization_id": organization_id},
@@ -583,7 +587,7 @@ def update_sales_lead(conn: sqlite3.Connection, payload: dict[str, Any], actor: 
     conn.execute(
         """INSERT INTO sales_activities(organization_id,company_id,activity_type,old_status,new_status,
            channel,outcome,notes,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-        (organization_id, company_id, "STATUS_UPDATE", old_status, requested_status, "CALL",
+        (organization_id, company_id, "CONTACT_RECORDED" if recorded_contact else "STATUS_UPDATE", old_status, requested_status, "CALL",
          payload.get("call_outcome"), payload.get("notes"), actor, now),
     )
     if requested_status == "DO_NOT_CONTACT":

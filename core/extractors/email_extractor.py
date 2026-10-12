@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlparse
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
 
 from core.models import EmailData
+from core.async_deadline import bounded_await, CancellationStalled, positive_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,12 @@ class EmailCrawlerConfig:
     max_pages_per_domain: int = 20
     max_total_pages: int = 200
     timeout_per_website: int = 300
+    cleanup_timeout: float = 10
     extract_from_homepage_only: bool = False
+
+    def __post_init__(self):
+        self.timeout_per_website = positive_seconds(self.timeout_per_website)
+        self.cleanup_timeout = positive_seconds(self.cleanup_timeout)
 
 
 class EmailExtractor:
@@ -99,11 +105,14 @@ class EmailExtractor:
         self._browser_context: Optional[BrowserContext] = None
         self._browser: Optional[Browser] = None
         self._playwright: Optional[Playwright] = None
+        self._closed = False
 
     async def __aenter__(self) -> "EmailExtractor":
         """Async context manager entry."""
         try:
-            await self._initialize_browser()
+            # Keep initialization in its own task so cancellation can reach this
+            # owner's cleanup even if the browser operation does not acknowledge it.
+            await bounded_await(self._initialize_browser(), self.config.timeout_per_website)
         except BaseException:
             await self.close()
             raise
@@ -117,12 +126,23 @@ class EmailExtractor:
         """Initialize the Playwright browser with Chrome profile."""
         from playwright.async_api import async_playwright
 
-        self._playwright = await async_playwright().start()
+        async def adopt(resource, attribute, cleanup):
+            # Cancellation-resistant startup can finish after owner cleanup.
+            # Never install or use a late resource on the abandoned extractor.
+            if self._closed:
+                try:
+                    await bounded_await(getattr(resource, cleanup)(), self.config.cleanup_timeout)
+                except Exception:
+                    logger.warning("Late email browser resource cleanup failed", exc_info=True)
+                raise asyncio.CancelledError()
+            setattr(self, attribute, resource)
+
+        await adopt(await async_playwright().start(), "_playwright", "stop")
         playwright = self._playwright
 
         # Launch browser with existing Chrome profile
         if self.config.chrome_profile_path:
-            self._browser_context = await playwright.chromium.launch_persistent_context(
+            context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=self.config.chrome_profile_path,
                 headless=self.config.headless,
                 args=[
@@ -131,32 +151,37 @@ class EmailExtractor:
                 ],
                 bypass_csp=True,
             )
+            await adopt(context, "_browser_context", "close")
         else:
-            self._browser = await playwright.chromium.launch(
+            browser = await playwright.chromium.launch(
                 headless=self.config.headless,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                 ],
             )
-            self._browser_context = await self._browser.new_context()
+            await adopt(browser, "_browser", "close")
+            await adopt(await browser.new_context(), "_browser_context", "close")
 
         logger.info("Browser initialized (headless=%s, profile=%s)",
                      self.config.headless, self.config.chrome_profile_path)
 
     async def close(self) -> None:
         """Close the browser and clean up resources."""
+        self._closed = True
         # Closing a non-persistent context does not close its browser or the
         # Playwright driver. Release all three, including partial initialization.
         resources = ((self._browser_context, "close"), (self._browser, "close"),
                      (self._playwright, "stop"))
         self._browser_context = self._browser = self._playwright = None
-        for resource, method in resources:
+        async def release(resource, method):
             if resource is not None:
                 try:
-                    await getattr(resource, method)()
+                    await bounded_await(getattr(resource, method)(), self.config.cleanup_timeout)
                 except Exception:
                     logger.warning("Email browser cleanup failed: %s", method, exc_info=True)
+        # Release independently: a stuck context must not prevent driver shutdown.
+        await asyncio.gather(*(release(resource, method) for resource, method in resources))
         logger.info("Browser closed")
 
     def _normalize_url(self, url: str) -> str:
@@ -386,7 +411,10 @@ class EmailExtractor:
         except Exception as e:
             logger.error("Error during email crawl of %s: %s", homepage, e)
         finally:
-            await page.close()
+            try:
+                await bounded_await(page.close(), self.config.cleanup_timeout)
+            except Exception:
+                logger.warning("Email page cleanup failed", exc_info=True)
 
         return list(self._emails.values())
 
@@ -413,8 +441,21 @@ class EmailExtractor:
             logger.info("Crawling website %d/%d: %s", i + 1, len(websites), website)
 
             try:
-                emails = await self.crawl_website(website, company_name, job_id)
+                emails = await bounded_await(
+                    self.crawl_website(website, company_name, job_id),
+                    self.config.timeout_per_website,
+                    cancellation_grace=self.config.cleanup_timeout,
+                )
                 for email in emails:
+                    all_emails[email.email] = email
+            except CancellationStalled:
+                # Do not reuse extractor state while an old website still mutates it.
+                raise
+            except TimeoutError:
+                logger.warning("Email website timeout after %gs: %s",
+                               self.config.timeout_per_website, website)
+                # Keep addresses already found before the website deadline.
+                for email in self._emails.values():
                     all_emails[email.email] = email
             except Exception as e:
                 logger.error("Failed to crawl %s: %s", website, e)

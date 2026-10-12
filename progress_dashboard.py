@@ -6,24 +6,42 @@ import html
 import csv
 import io
 import json
+import re
+import secrets
 import sqlite3
 import threading
 import tempfile
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from lead_intelligence_v4 import INTELLIGENCE_VERSION, SALES_STATUSES, update_sales_lead
+from collector_control import CollectorController
+from collection_selection import catalog, preview_selection
+from system_memory import available_memory
+from sales_updates import save_sales_update, StaleSalesEdit
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "malaysia_qualified_companies.sqlite"
 STATUS_PATH = ROOT / "data" / "malaysia_batch_status.json"
 PORT = 8765
 DASHBOARD_CACHE_SECONDS = 120
+COLLECTOR_TOKEN = secrets.token_urlsafe(32)
+_collector_controller: CollectorController | None = None
+_collector_controller_lock = threading.Lock()
+
+
+def collector_controller() -> CollectorController:
+    global _collector_controller
+    with _collector_controller_lock:
+        if (_collector_controller is None or _collector_controller.database != DB_PATH.resolve()
+                or _collector_controller.status_file != STATUS_PATH.resolve()):
+            _collector_controller = CollectorController(DB_PATH, STATUS_PATH)
+        return _collector_controller
 
 _dashboard_cache_lock = threading.Lock()
 _dashboard_cache: dict | None = None
@@ -44,9 +62,9 @@ def table(headers: list[str], rows: list[tuple]) -> str:
 
 
 NAV_ITEMS = (
-    ("dashboard", "/", "Dashboard"),
-    ("leads", "/leads", "Ranked Leads"),
-    ("pipeline", "/pipeline", "Sales Pipeline"),
+    ("dashboard", "/", "Collect leads"),
+    ("leads", "/leads", "Review leads"),
+    ("pipeline", "/pipeline", "Sales pipeline"),
     ("coverage", "/coverage", "Coverage & Yield"),
     ("searches", "/searches", "Search Queries"),
     ("report", "/export/report.html", "Summary Report"),
@@ -59,6 +77,19 @@ def navigation(active: str = "") -> str:
         for key, url, label in NAV_ITEMS
     )
     return f"<nav class='topnav' aria-label='Dashboard pages'>{links}</nav>"
+
+
+def environment_notice() -> str:
+    temporary = any(root in DB_PATH.resolve().parents for root in
+                    (Path('/private/tmp'), Path('/tmp'), Path(tempfile.gettempdir()).resolve()))
+    label = 'Temporary database' if temporary else 'Project database' if DB_PATH == ROOT / 'data' / 'malaysia_qualified_companies.sqlite' else 'Custom database'
+    explanation = 'This is not the production database. It may contain live collected leads; export or migrate them before clearing temporary files.' if temporary else 'Collection and sales updates are stored in this database.'
+    return f"<aside id='environment-notice' class='notice' aria-label='Data environment'><strong>{label}</strong> · {explanation}<details><summary>Database location</summary><code>{esc(DB_PATH)}</code></details></aside>"
+
+
+def memory_label(status: dict) -> str:
+    value = status.get('available_ram_gb')
+    return 'Unavailable' if value is None else f'{value:.2f} GiB available ({status.get("ram_operating_state", "unknown")})'
 
 
 def connection() -> sqlite3.Connection:
@@ -236,9 +267,13 @@ def report_page(data: dict) -> str:
 
 
 def load_status() -> dict:
-    if not STATUS_PATH.exists():
-        return {}
-    return json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+    status = json.loads(STATUS_PATH.read_text(encoding='utf-8')) if STATUS_PATH.exists() else {}
+    # Dashboard always measures this host, even while an older collector runs.
+    status['collector_memory_legacy'] = 'memory_source' not in status and bool(status)
+    if status['collector_memory_legacy']:
+        status['lowest_available_ram_gb'] = None
+    status.update(available_memory())
+    return status
 
 
 def collector_state(status: dict) -> tuple[str, str]:
@@ -257,6 +292,8 @@ def collector_state(status: dict) -> tuple[str, str]:
 
 def read_dashboard_data() -> dict:
     status = load_status()
+    if not DB_PATH.exists():
+        return _empty_dashboard_data()
     conn = connection()
     sectors = conn.execute(
         """SELECT industry_label,COUNT(*) FROM company_industry_classification
@@ -317,10 +354,13 @@ def read_dashboard_data() -> dict:
              ON li.company_id=c.id AND li.intelligence_version=4
            GROUP BY market ORDER BY COUNT(*) DESC"""
     ).fetchall()
+    company_count = conn.execute('SELECT COUNT(*) FROM companies').fetchone()[0]
+    ready_count = conn.execute('SELECT COUNT(*) FROM (' + call_list_query() + ')').fetchone()[0]
     conn.close()
     return {"status": status, "sectors": sectors, "tiers": tiers, "states": states,
             "recent": recent, "jobs": jobs, "events": events, "totals": totals,
-            "ranks": ranks, "offers": offers, "pipeline": pipeline, "markets": markets}
+            "ranks": ranks, "offers": offers, "pipeline": pipeline, "markets": markets,
+            "company_count": company_count, "ready_count": ready_count}
 
 
 def _empty_dashboard_data() -> dict:
@@ -328,7 +368,7 @@ def _empty_dashboard_data() -> dict:
     return {
         "status": load_status(), "sectors": [], "tiers": [], "states": [],
         "recent": [], "jobs": [], "events": [], "totals": (0, 0, 0, 0),
-        "ranks": [], "offers": [], "pipeline": [], "markets": [],
+        "ranks": [], "offers": [], "pipeline": [], "markets": [], "analytics_loading": True,
     }
 
 
@@ -381,16 +421,29 @@ td{padding:8px;border-bottom:1px solid #e4ebef;vertical-align:top;max-width:380p
 .table-wrap{overflow:auto;max-height:470px;border:1px solid #d8e2e8;border-radius:8px}
 input,select,textarea{padding:9px;border:1px solid #b9c8d1;border-radius:6px;margin:0 8px 12px 0;background:white}input[type=text]{width:min(480px,90%)}textarea{width:min(900px,95%);height:180px}
 .actions{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}.button{display:inline-block;padding:10px 14px;border-radius:7px;background:#1f6f8b;color:white;text-decoration:none;font-size:14px}.button:hover{background:#15566d}
+button:disabled{opacity:.45;cursor:not-allowed}
+[hidden]{display:none!important}.scope-fields label{display:block}.scope-fields select[multiple]{width:100%;max-width:520px}.scope-fields textarea{height:70px;width:95%}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
+.notice{padding:14px 18px;border:1px solid #c4d9e5;background:#eaf3f8;border-radius:8px;margin-bottom:20px;line-height:1.5}.notice code{overflow-wrap:anywhere}
+.journey{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0 24px}.journey a{padding:10px 14px;background:white;border:1px solid #b9c8d1;border-radius:7px;text-decoration:none}
+summary{cursor:pointer;font-weight:600;padding:12px 0}details{margin:12px 0}h3{font-size:17px;margin:18px 0 12px}
+.filter-fields{display:flex;gap:12px;flex-wrap:wrap;align-items:end}.filter-fields label{display:flex;flex-direction:column;gap:6px}.filter-fields input,.filter-fields select{margin:0;max-width:100%;box-sizing:border-box}
+.badge{display:inline-block;border-radius:5px;background:#eaf3f8;color:#123047;padding:4px 7px}.nowrap{white-space:nowrap!important;word-break:normal}.muted{color:#526875}
+.mobile-leads{display:none}.lead-card{margin:12px 0}.lead-card h3{margin-top:0}.lead-card p{overflow-wrap:anywhere}
+.desktop-leads table{font-size:14px}.desktop-leads td{padding:12px}.form-grid label{display:flex;flex-direction:column;gap:6px}.form-grid input,.form-grid select,.form-grid textarea{width:100%;box-sizing:border-box;margin:0}.form-grid textarea{height:110px}
+:focus-visible{outline:3px solid #af5700;outline-offset:3px}.primary-cards{grid-template-columns:repeat(4,minmax(0,1fr))}.help{line-height:1.6;max-width:900px}
+@media(max-width:650px){main{padding:0 16px}header{padding:22px 20px}h1{font-size:24px}.desktop-leads{display:none}.mobile-leads{display:block}.primary-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.filter-fields label{width:100%}.filter-fields input,.filter-fields select{width:100%}.button{min-height:24px}.journey{gap:8px}.journey a{flex:1 1 130px}.value{font-size:24px}}
 """
 
 
 def dashboard_page(data: dict) -> str:
     status = data["status"]
-    qualified = int(status.get("qualified_companies", 0))
+    qualified = int(status.get("qualified_companies", data.get('company_count', 0)))
     target = int(status.get("target_qualified_companies", 400_000))
     progress = min(100.0, qualified / target * 100) if target else 0
-    state, state_class = collector_state(status)
+    control = collector_controller().snapshot()
+    state = control['state'].title()
+    state_class = 'good' if control['state'] in ('running', 'completed') else 'bad' if control['state'] == 'failed' else 'warn'
     totals = data["totals"]
     eta = status.get("eta_hours")
     query_rate = float(status.get("query_rate_per_hour_24h", 0) or 0)
@@ -402,29 +455,232 @@ def dashboard_page(data: dict) -> str:
     maximum_workers = int(status.get("maximum_workers", 4) or 4)
     ram_state = str(status.get("ram_operating_state", "unknown"))
     ram_class = "good" if ram_state == "healthy" else "bad" if ram_state == "critical" else "warn"
-    return f"""<!doctype html><html><head><meta charset='utf-8'>
+    progress_text = '<0.1%' if 0 < progress < .1 else f'{progress:.1f}%'
+    return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>LOCUS-T Lead Intelligence V4</title><style>{CSS}</style></head><body>
-    <header><h1>LOCUS-T Lead Intelligence V4</h1>{navigation('dashboard')}<p>400,000 qualified Malaysian locations · focus: Klang Valley, Johor and Penang (87%); GDP-ranked Peninsular pilot (13%)</p>
+    <header><h1>Collect and review leads</h1>{navigation('dashboard')}<p>Build a lead list, review sales opportunities, then record your team's outcomes.</p>
     <div class='status-strip'>
       <span>Dashboard refreshed: <strong id='dashboard-refresh'>--</strong></span>
       <span><i id='heartbeat-dot' class='dot {state_class}'></i>Collector updated: <strong id='collector-update'>--</strong> (<span id='heartbeat-age'>--</span>)</span>
       <span>Next full refresh: <strong id='refresh-countdown'>30s</strong></span>
       <span>Browsers: <strong id='header-workers'>{actual_workers} active / {worker_limit} allowed / {maximum_workers} max</strong></span>
-      <span>Free RAM: <strong id='header-ram' class='{ram_class}'>{esc(status.get('available_ram_gb','?'))} GB ({esc(ram_state)})</strong></span>
+      <span>Device memory: <strong id='header-ram' class='{ram_class}'>{esc(memory_label(status))}</strong></span>
       <span>24h query rate: <strong id='header-query-rate'>{query_rate:.1f}/hour</strong></span>
     </div></header>
-    <main><div class='cards'>
-      <div class='card'><div class='label'>Qualified locations</div><div class='value'>{qualified:,}</div></div>
-      <div class='card'><div class='label'>Target / progress</div><div class='value'>{target:,}</div><div class='small'>{progress:.1f}%</div></div>
-      <div class='card'><div class='label'>Collector</div><div class='value {state_class}'>{state}</div><div class='small'>Pilot: {esc(status.get('pilot_status','pending'))}</div></div>
+    <main>
+    {environment_notice()}
+    <nav class='journey' aria-label='Lead workflow'><a href='#collection-setup'>1. Collect leads</a><a href='/leads'>2. Review leads</a><a href='/pipeline'>3. Assign and track sales</a></nav>
+    <p class='help'>New here? Choose one industry and a small area, preview the searches, then start collection. Review the results before handing them to sales. No messages are sent by this dashboard.</p>
+    <section id='collection-setup' class='card' aria-label='Collector controls'>
+      <h2 style='margin-top:0'>Set up your collection</h2>
+      <h3>1. Choose businesses and search areas</h3>
+      <p><label>Search plan <select id="collector-mode"><option value="default">Default recommended plan</option>
+        <option value="selected">Choose industries and locations</option></select></label></p>
+      <div id="collector-scope" class="scope-fields" hidden>
+        <div class='grid2'>
+          <div><label for="collector-industries">Industries</label><select id="collector-industries" multiple size="6"></select>
+            <p class='small'>Select one or more industries. Hold Ctrl / Command to select multiple options.</p>
+            <label for="collector-keywords">Custom search keywords (optional, one per line)</label>
+            <textarea id="collector-keywords" placeholder="commercial refrigeration contractor"></textarea>
+            <label for="collector-custom-industry">Classify custom keywords as</label><select id="collector-custom-industry"></select>
+            <p class='small'>Custom keywords replace preset industry keywords and use the classification above.</p></div>
+          <div><label for="collector-states">Malaysian states</label><select id="collector-states" multiple size="6"></select>
+            <label for="collector-cities">Cities / areas (optional)</label><select id="collector-cities" multiple size="6"></select>
+            <label for="collector-custom-state">State for custom areas</label><select id="collector-custom-state"></select>
+            <label for="collector-areas">Custom neighbourhoods, postcodes or industrial parks (one per line)</label>
+            <textarea id="collector-areas" placeholder="Seksyen 15"></textarea>
+            <p class='small'>Leave cities and custom areas empty to search all listed cities in selected states.
+              For areas in different states, enter State | Area on each line.
+              Search areas are not geographic boundaries: Google Maps may return nearby businesses.</p></div>
+        </div>
+      </div>
+      <p id='campaign-summary' class='notice' aria-live='polite'></p>
+      <p id='scope-lock-notice' class='small' hidden>Collection is running. Pause and wait for active searches to finish before changing the search plan.</p>
+      <h3>2. Set your total lead goal</h3>
+      <label>Total qualified-location target <input id="collector-target" type="number" min="1" max="10000000" value="{int(control.get('target', target))}"></label>
+      <p class='small'>{qualified:,} locations currently collected. This goal is the database total, not additional leads.</p>
+      <details><summary>Advanced collection settings</summary><label>Maximum browser workers <input id="collector-workers" type="number" min="1" max="6" value="{int(control.get('workers', 5))}"></label><p class='small'>More workers use more device memory. The collector adapts within this limit.</p></details>
+      <h3>3. Preview, then start</h3>
+      <p class='small'>Preview confirms pending searches without collecting or saving leads. Preview again after changing your settings.</p>
+      <div class='actions'><button id="collector-start" class='button'>Start / Resume</button>
+        <button id="collector-pause" class='button'>Pause</button>
+        <button id="collector-preview" class='button'>Preview searches</button></div>
+      <pre id="collector-query-preview" aria-live="polite" style="white-space:pre-wrap;max-height:260px;overflow:auto"></pre>
+      <p id="collector-control-state" role='status' aria-live='polite'>{esc(state)}</p>
+      <p class='small'>Pause stops new searches and lets active searches finish. Saved leads and search progress are retained.
+        Closing this dashboard does not stop collection. Website enrichment runs separately.</p>
+      <p class='small'>The lead target is the total number of qualified locations in this database, not an additional-lead count.</p>
+    </section>
+    <script>
+    const collectorToken = {json.dumps(COLLECTOR_TOKEN)};
+    const collectionCatalog = {json.dumps(catalog()).replace('<', chr(92) + 'u003c')};
+    let collectorBusy = false;
+    let collectorActive = false;
+    let collectionDirty = false;
+    let previewReady = false;
+    let settingsRevision = 0;
+    const selectedValues = id => Array.from(document.getElementById(id).selectedOptions).map(option => option.value);
+    const lines = id => document.getElementById(id).value.split(/\\r?\\n/).map(value => value.trim()).filter(Boolean);
+    function fillOptions(id, values, selected = []) {{
+      const node = document.getElementById(id);
+      node.replaceChildren();
+      values.forEach(item => {{
+        const option = new Option(item.label ?? item, item.value ?? item);
+        option.selected = selected.includes(option.value);
+        node.add(option);
+      }});
+    }}
+    function updateCities() {{
+      const states = selectedValues('collector-states');
+      const selected = selectedValues('collector-cities');
+      fillOptions('collector-cities', collectionCatalog.cities.filter(item => states.includes(item.state)).map(item =>
+        ({{label:item.locality + ' — ' + item.state, value:JSON.stringify(item)}})), selected);
+      const customState = document.getElementById('collector-custom-state').value;
+      fillOptions('collector-custom-state', states, [customState]);
+    }}
+    function scopeControls() {{
+      const choosing = document.getElementById('collector-mode').value === 'selected';
+      document.getElementById('collector-scope').hidden = !choosing;
+      document.getElementById('collector-mode').disabled = collectorActive || collectorBusy;
+      document.querySelectorAll('#collector-scope input, #collector-scope select, #collector-scope textarea').forEach(node => {{
+        node.disabled = !choosing || collectorActive || collectorBusy;
+      }});
+      if (lines('collector-keywords').length) document.getElementById('collector-industries').disabled = true;
+      document.getElementById('collector-preview').disabled = collectorBusy || collectorActive;
+      document.getElementById('collector-start').disabled = collectorBusy || collectorActive || !previewReady;
+      document.getElementById('scope-lock-notice').hidden = !collectorActive;
+      const summary = document.getElementById('campaign-summary');
+      if (!choosing) summary.textContent = 'Broad built-in plan: 26 industries in Klang Valley, Johor and Penang; smaller pilots in Perak, Pahang, Kedah, Negeri Sembilan and Melaka. Successful searches can expand to smaller areas.';
+      else {{
+        const terms = lines('collector-keywords');
+        const industries = terms.length ? terms.join(', ') : selectedValues('collector-industries').join(', ');
+        const states = selectedValues('collector-states').join(', ');
+        const cityCount = selectedValues('collector-cities').length + lines('collector-areas').length;
+        summary.textContent = (industries || 'Choose an industry') + ' · ' + (states || 'Choose a state') + ' · ' + (cityCount ? cityCount + ' selected areas' : 'All listed cities in selected states') + '. This plan will not automatically expand to other areas.';
+      }}
+    }}
+    function currentSelection() {{
+      if (document.getElementById('collector-mode').value === 'default') return {{mode:'default'}};
+      return {{mode:'selected', industries:selectedValues('collector-industries'), states:selectedValues('collector-states'),
+        cities:selectedValues('collector-cities').map(value => JSON.parse(value)),
+        custom_keywords:lines('collector-keywords'), custom_industry:document.getElementById('collector-custom-industry').value,
+        custom_locations:lines('collector-areas').map(value => {{
+          const divider = value.indexOf(' | ');
+          return divider < 0 ? {{state:document.getElementById('collector-custom-state').value, locality:value}}
+            : {{state:value.slice(0, divider).trim(), locality:value.slice(divider + 3).trim()}};
+        }})}};
+    }}
+    function restoreSelection(selection) {{
+      document.getElementById('collector-mode').value = selection.mode || 'default';
+      fillOptions('collector-industries', collectionCatalog.industries, selection.industries || []);
+      fillOptions('collector-states', collectionCatalog.states, selection.states || []);
+      fillOptions('collector-custom-industry', [''].concat(collectionCatalog.industries), [selection.custom_industry || '']);
+      updateCities();
+      const cities = (selection.cities || []).map(item => JSON.stringify(item));
+      Array.from(document.getElementById('collector-cities').options).forEach(option => option.selected = cities.includes(option.value));
+      const custom = selection.custom_locations || [];
+      document.getElementById('collector-keywords').value = (selection.custom_keywords || []).join('\\n');
+      const multistate = new Set(custom.map(item => item.state)).size > 1;
+      document.getElementById('collector-areas').value = custom.map(item =>
+        multistate ? item.state + ' | ' + item.locality : item.locality).join('\\n');
+      if (custom.length) document.getElementById('collector-custom-state').value = custom[0].state;
+      scopeControls();
+    }}
+    function showCollector(control) {{
+      const active = ['starting','running','pausing'].includes(control.state);
+      collectorActive = active;
+      scopeControls();
+      document.getElementById('collector-start').disabled = active || collectorBusy || !previewReady;
+      document.getElementById('collector-pause').disabled = !active || control.state === 'pausing' || collectorBusy;
+      document.getElementById('collector-target').disabled = active;
+      document.getElementById('collector-workers').disabled = active;
+      document.getElementById('collector-control-state').textContent = control.state + (control.error ? ': ' + control.error : '');
+      const stateCard = document.getElementById('collector-state');
+      stateCard.textContent = control.state.charAt(0).toUpperCase() + control.state.slice(1);
+      stateCard.className = 'value ' + (control.state === 'failed' ? 'bad' : ['running','completed'].includes(control.state) ? 'good' : 'warn');
+    }}
+    async function refreshCollector() {{
+      try {{
+        const response = await fetch('/api/collector', {{cache:'no-store'}});
+        if (!response.ok) throw new Error('Collector status unavailable');
+        showCollector(await response.json());
+      }} catch (error) {{ document.getElementById('collector-control-state').textContent = error.message; }}
+    }}
+    async function controlCollector(action) {{
+      collectorBusy = true;
+      scopeControls();
+      document.getElementById('collector-start').disabled = true;
+      document.getElementById('collector-pause').disabled = true;
+      try {{
+        const response = await fetch('/api/collector/' + action, {{method:'POST',
+          headers:{{'Content-Type':'application/json','X-Collector-Token':collectorToken}},
+          body:JSON.stringify({{target:Number(document.getElementById('collector-target').value),
+                               workers:Number(document.getElementById('collector-workers').value), selection:currentSelection()}})}});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Collector control failed');
+        collectorBusy = false;
+        collectionDirty = false;
+        previewReady = false;
+        showCollector(result);
+      }} catch (error) {{
+        collectorBusy = false;
+        await refreshCollector();
+        document.getElementById('collector-control-state').textContent = error.message;
+      }}
+    }}
+    document.getElementById('collector-start').onclick = () => controlCollector('start');
+    document.getElementById('collector-pause').onclick = () => controlCollector('pause');
+    document.getElementById('collector-preview').onclick = async () => {{
+      const node = document.getElementById('collector-query-preview');
+      const revision = settingsRevision;
+      previewReady = false;
+      scopeControls();
+      node.textContent = 'Generating query preview…';
+      try {{
+        const response = await fetch('/api/collector/preview', {{method:'POST',
+          headers:{{'Content-Type':'application/json','X-Collector-Token':collectorToken}},
+          body:JSON.stringify({{selection:currentSelection()}})}});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Preview failed');
+        if (revision !== settingsRevision) throw new Error('Settings changed during preview. Preview again before starting.');
+        previewReady = true;
+        scopeControls();
+        node.textContent = result.query_count + ' pending searches (completed searches are skipped).\\n'
+          + result.sample.map(item => item.query).join('\\n') + '\\n' + result.location_notice;
+      }} catch (error) {{ node.textContent = error.message; }}
+    }};
+    document.querySelectorAll('#collector-mode, #collector-scope select, #collector-scope textarea, #collector-target, #collector-workers').forEach(node => {{
+      node.addEventListener('input', () => {{
+        collectionDirty = true;
+        settingsRevision += 1;
+        previewReady = false;
+        if (node.id === 'collector-states') updateCities();
+        scopeControls();
+        document.getElementById('collector-query-preview').textContent = '';
+      }});
+    }});
+    document.addEventListener('DOMContentLoaded', () => {{
+      restoreSelection({json.dumps(control['selection']).replace('<', chr(92) + 'u003c')});
+      showCollector({json.dumps(control).replace('<', chr(92) + 'u003c')});
+      setInterval(refreshCollector, 5000);
+    }});
+    </script>
+    <div class='cards primary-cards' style='margin-top:18px'>
+      <div class='card'><div class='label'>Collected locations</div><div class='value'>{'Loading…' if data.get('analytics_loading') and 'qualified_companies' not in status else f'{qualified:,}'}</div><div class='small'>Passed collection checks; not necessarily sales-ready.</div></div>
+      <div class='card'><div class='label'>Total lead goal</div><div class='value'>{target:,}</div><div class='small'>{progress_text} collected</div></div>
+      <div class='card'><div class='label'>Collector</div><div id='collector-state' class='value {state_class}'>{state}</div><div class='small'>Pilot: {esc(status.get('pilot_status','pending'))}</div></div>
+      <div class='card'><div class='label'>Sales-ready organizations</div><div class='value'>{'Loading…' if data.get('analytics_loading') else f"{int(data.get('ready_count', 0)):,}"}</div><div class='small'>A/B rank, deduplicated, excluding lost and do-not-contact.</div><a href='/leads'>Review leads →</a></div>
+    </div>
+    <div class='bar' role='progressbar' aria-label='Total lead goal' aria-valuemin='0' aria-valuemax='100' aria-valuenow='{progress:.3f}'><span style='width:{progress:.2f}%'></span></div>
+    <p class='small'>Next: <a href='/leads'>review collected leads</a>, then <a href='/pipeline'>assign a salesperson and record outcomes</a>.</p>
+    <details id='advanced-diagnostics'><summary>Advanced diagnostics · workers, memory and collection speed</summary><div class='cards'>
       <div class='card'><div class='label'>Browser control</div><div class='value'>{actual_workers} / {worker_limit}</div><div class='small'>Active / allowed · maximum {maximum_workers}</div></div>
       <div class='card'><div class='label'>Last hour / ETA</div><div class='value'>{int(status.get('qualified_last_hour',0)):,}</div><div class='small'>ETA: {esc(eta if eta is not None else 'calculating')} hours</div></div>
       <div class='card'><div class='label'>Estimated queries/hour (24h)</div><div class='value'>{query_rate:.1f}</div><div class='small'>{query_count:,} queries over {query_window:.2f} observed hours</div></div>
-      <div class='card'><div class='label'>RAM operating state</div><div class='value {ram_class}'>{esc(ram_state.title())}</div><div class='small'>{esc(status.get('available_ram_gb','?'))} GB free · {esc(status.get('reserved_ram_gb',2))} GB reserved · {esc(status.get('ram_policy_mode','balanced'))} mode</div></div>
-      <div class='card'><div class='label'>Memory recoveries</div><div class='value'>{int(status.get('reclaimed_jobs',0)):,}</div><div class='small'>{int(status.get('memory_pressure_pauses',0)):,} pauses · lowest {esc(status.get('lowest_available_ram_gb','?'))} GB at {esc(status.get('lowest_available_ram_at') or 'n/a')}</div></div>
+      <div class='card'><div class='label'>Available memory on this device</div><div class='value {ram_class}'>{esc(memory_label(status))}</div><div class='small'>{esc(status.get('memory_source','unavailable'))}. Includes reclaimable memory, not just unused RAM.</div></div>
+      <div class='card'><div class='label'>Memory recoveries</div><div class='value'>{int(status.get('reclaimed_jobs',0)):,}</div><div class='small'>{int(status.get('memory_pressure_pauses',0)):,} pauses · historical minimum {esc(status.get('lowest_available_ram_gb') if status.get('lowest_available_ram_gb') is not None else 'unavailable')} GiB</div></div>
       <div class='card'><div class='label'>Renderer recycling</div><div class='value'>{int(status.get('page_recycle_count',0)):,}</div><div class='small'>{int(status.get('memory_cleanup_count',0)):,} in-feed cleanups · context every 10 details</div></div>
-    </div>
-    <div class='bar'><span style='width:{progress:.2f}%'></span></div>
+    </div><p class='small'>{'An older collector is running without verified cross-platform memory detection. Restart collection when convenient to apply the memory safety fix.' if status.get('collector_memory_legacy') and control['state'] in ('starting','running','pausing') else 'Memory protection uses the measured capacity; unavailable measurements block new browser submissions.'}</p></details>
     <div class='label'>Updated: {esc(status.get('updated_at'))} · {esc(status.get('halt_reason') or 'No halt reason')}</div>
     <h2>Reports and exports</h2>
     <div class='actions'>
@@ -441,16 +697,16 @@ def dashboard_page(data: dict) -> str:
       <div class='card'><div class='label'>Rejected</div><div class='value'>{int(totals[3]):,}</div></div>
     </div>
     <div class='grid2'><div><h2>Sales-readiness ranks</h2>{table(['Rank','Organizations / locations'],data.get('ranks',[]))}</div>
-    <div><h2>Primary LOCUS-T offer</h2>{table(['Offer','Leads'],data.get('offers',[]))}</div></div>
+    <div><h2>Suggested LOCUS-T offer</h2>{table(['Offer','Locations'],[(friendly(offer),count) for offer,count in data.get('offers',[])])}</div></div>
     <div class='grid2'><div><h2>Sales pipeline</h2>{table(['Status','Organizations'],data.get('pipeline',[]))}</div>
     <div><h2>Priority-market coverage</h2>{table(['Market','Locations','A/B leads'],data.get('markets',[]))}</div></div>
-    <div class='grid2'><div><h2>Lead tiers</h2>{table(['Tier','Locations'],data['tiers'])}</div>
+    <div class='grid2'><div><h2>Lead tiers</h2>{table(['Tier','Locations'],[(friendly(tier),count) for tier,count in data['tiers']])}</div>
     <div><h2>States</h2>{table(['State','Locations'],data['states'])}</div></div>
     <h2>Industries</h2>{table(['Industry','Locations'],data['sectors'])}
-    <h2>Latest qualified locations</h2>{table(['Business','Industry','Area','Maps category','Lead tier','Phone','Website','Rating'],data['recent'])}
-    <h2>Latest searches</h2><p><a href='/searches'>View the complete search manifest →</a></p>
+    <details><summary>Recent collected locations</summary>{table(['Business','Industry','Area','Maps category','Lead tier','Phone','Website','Rating'],data['recent'])}</details>
+    <details><summary>Search execution and worker events</summary><p><a href='/searches'>View the complete search manifest →</a></p>
     {table(['Prompt','Status','Links','Processed','New','Duplicates','Rejected','Worker','Completed','Error'],data['jobs'])}
-    <h2>Worker and throttle events</h2>{table(['Event','Details','Workers','Free RAM GB','Time'],data['events'])}
+    <h2>Worker and throttle events</h2>{table(['Event','Details','Workers','Recorded RAM GiB','Time'],data['events'])}</details>
     </main>
     <script>
     const refreshStarted = new Date();
@@ -467,7 +723,7 @@ def dashboard_page(data: dict) -> str:
       dot.className = 'dot ' + (age < 60 ? 'good' : age <= 180 ? 'warn' : 'bad');
       document.getElementById('refresh-countdown').textContent = countdown+'s';
       countdown -= 1;
-      if (countdown < 0) location.reload();
+      if (countdown < 0) {{ if (collectionDirty) countdown = 30; else location.reload(); }}
     }}
     async function refreshStatus() {{
       try {{
@@ -479,7 +735,7 @@ def dashboard_page(data: dict) -> str:
         document.getElementById('header-workers').textContent = `${{actual}} active / ${{allowed}} allowed / ${{live.maximum_workers ?? 4}} max`;
         const ramState = live.ram_operating_state ?? 'unknown';
         const ramNode = document.getElementById('header-ram');
-        ramNode.textContent = `${{live.available_ram_gb ?? '?'}} GB (${{ramState}})`;
+        ramNode.textContent = live.available_ram_gb == null ? 'Unavailable' : `${{Number(live.available_ram_gb).toFixed(2)}} GiB available (${{ramState}})`;
         ramNode.className = ramState === 'healthy' ? 'good' : ramState === 'critical' ? 'bad' : 'warn';
         document.getElementById('header-query-rate').textContent = `${{Number(live.query_rate_per_hour_24h ?? 0).toFixed(1)}}/hour`;
       }} catch (_) {{}}
@@ -534,9 +790,9 @@ def searches_page(query: str = "", page_number: int = 1) -> str:
 
 
 def page(title: str, body: str, active: str = "") -> str:
-    return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title>
+    return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>
     <style>{CSS}</style></head><body><header><h1>{esc(title)}</h1>{navigation(active)}
-    </header><main>{body}</main></body></html>"""
+    </header><main>{environment_notice()}{body}</main></body></html>"""
 
 
 def ranked_leads_page(params: dict[str, list[str]]) -> str:
@@ -571,6 +827,7 @@ def ranked_leads_page(params: dict[str, list[str]]) -> str:
                    li.primary_offer,li.sales_readiness_score,li.sales_rank,COALESCE(sl.status,'NEW'),
                    COALESCE(sl.assigned_pic,''),c.phone,COALESCE(wi.public_email,''),c.website,
                    c.locality,c.state_name,c.rating,c.reviews_count
+                   ,c.id
             FROM lead_intelligence li JOIN companies c ON c.id=li.company_id
             LEFT JOIN company_industry_classification ic ON ic.company_id=c.id AND ic.taxonomy_version=4
             LEFT JOIN sales_leads sl ON sl.organization_id=li.organization_id
@@ -588,24 +845,151 @@ def ranked_leads_page(params: dict[str, list[str]]) -> str:
     conn.close()
     def choices(name: str, items: list[str]) -> str:
         selected = filters.get(name, "")
-        return "<option value=''>All " + esc(name) + "s</option>" + "".join(
-            f"<option value='{esc(item)}'{' selected' if item == selected else ''}>{esc(item)}</option>" for item in items
+        plural = {'industry':'industries','status':'statuses'}.get(name, name + 's')
+        return "<option value=''>All " + esc(plural) + "</option>" + "".join(
+            f"<option value='{esc(item)}'{' selected' if item == selected else ''}>{esc(friendly(item))}</option>" for item in items
         )
     pages = max(1, (total + per_page - 1) // per_page)
     nav_params = "&".join(f"{esc(k)}={esc(v)}" for k, v in filters.items() if k != "page")
     previous = f"<a href='/leads?{nav_params}&page={page_number-1}'>Previous</a>" if page_number > 1 else ""
     next_link = f"<a href='/leads?{nav_params}&page={page_number+1}'>Next</a>" if page_number < pages else ""
-    body = f"""<form method='get'><input type='text' name='q' value='{esc(filters.get('q',''))}' placeholder='Business, phone, or website'>
-      <select name='rank'>{choices('rank', ['A','B','C','D'])}</select>
-      <select name='offer'>{choices('offer', options['offer'])}</select>
-      <select name='industry'>{choices('industry', options['industry'])}</select>
-      <select name='state'>{choices('state', options['state'])}</select>
-      <select name='status'>{choices('status', list(SALES_STATUSES))}</select>
+    body = f"""<p class='help'>Review the most promising leads first, then open a business to assign a salesperson or record an outcome. A/B ranks are higher-priority opportunities; they are not confirmed customer interest.</p>
+      <details><summary>What do the ranks mean?</summary><p>A: score 75+ · B: 60–74 · C: 45–59 · D: below 45. Scores combine reachability, service need, capacity, demand and freshness. Open a lead for its score breakdown.</p></details>
+      <form method='get'><div class='filter-fields'><label>Search businesses<input type='search' name='q' value='{esc(filters.get('q',''))}' placeholder='Business, phone, or website'></label>
+      <label>Sales-readiness rank<select name='rank'>{choices('rank', ['A','B','C','D'])}</select></label>
+      <label>Suggested offer<select name='offer'>{choices('offer', options['offer'])}</select></label>
+      <label>Industry<select name='industry'>{choices('industry', options['industry'])}</select></label>
+      <label>State<select name='state'>{choices('state', options['state'])}</select></label>
+      <label>Sales status<select name='status'>{choices('status', list(SALES_STATUSES))}</select></label></div>
       <button class='button' type='submit'>Filter</button></form>
       <p>{total:,} matching locations · page {page_number:,}/{pages:,} · {previous} &nbsp; {next_link}</p>
-      <div class='actions'><a class='button' href='/export/call-list.csv'>Download brand-deduplicated A/B call list</a></div>
-      {table(['Org ID','Business','Industry','Offer','Score','Rank','Status','PIC','Phone','Email','Website','Locality','State','Rating','Reviews'], rows)}"""
-    return page("Ranked LOCUS-T leads", body, "leads")
+      <div class='actions'><a class='button' href='/export/call-list.csv'>Download all eligible A/B organizations</a></div>
+      <p class='small'>The call-list export covers all eligible organizations, not just the filters above. Phone/email blanks mean no value has been collected.</p>
+      {compact_leads(rows)}"""
+    return page("Review leads", body, "leads")
+
+
+def friendly(value: object) -> str:
+    labels = {'ENRICHMENT_REQUIRED':'More research needed', 'WEBSITE_BUILD':'Website opportunity',
+              'SEO_UPGRADE':'SEO opportunity', 'DO_NOT_CONTACT':'Do not contact',
+              'PROPOSAL_SENT':'Proposal sent', 'high_value':'High-value searches',
+              'volume_gated':'Volume-limited searches', 'long_tail':'Specific searches',
+              'commercial':'Commercial searches', 'experimental':'Exploratory searches',
+              'selected':'Selected campaign', 'custom':'Custom keywords'}
+    return labels.get(str(value), str(value or '').replace('_',' ').title())
+
+
+def contact_links(phone, email='', website='') -> str:
+    links = []
+    digits = re.sub(r'[^+0-9]', '', str(phone or ''))
+    if len(digits) >= 3:
+        links.append(f"<a class='nowrap' href='tel:{esc(digits)}'>{esc(phone)}</a>")
+    if email and re.fullmatch(r'[^\s<>"\x27]+@[^\s<>"\x27]+\.[^\s<>"\x27]+', str(email)):
+        links.append(f"<a href='mailto:{esc(email)}'>{esc(email)}</a>")
+    if website and urlparse(str(website)).scheme in ('http','https') and urlparse(str(website)).netloc:
+        links.append(f"<a href='{esc(website)}' target='_blank' rel='noopener noreferrer'>Website</a>")
+    return '<br>'.join(links) or '<span class="muted">Contact details unavailable</span>'
+
+
+def compact_leads(rows) -> str:
+    desktop, mobile = [], []
+    for row in rows:
+        org, name, industry, offer, score, rank, status, owner, phone, email, website, city, state, rating, reviews, company_id = row
+        link = f"<a href='/lead?id={int(company_id)}' aria-label='Review {esc(name)}'>{esc(name)}</a>"
+        action = f"<a class='button' href='/lead?id={int(company_id)}'>Review</a>"
+        contact = contact_links(phone, email)
+        status_owner = f"{esc(friendly(status))}<br><span class='muted'>{esc(owner or 'Unassigned')}</span>"
+        location = ', '.join(str(part) for part in (city,state) if part)
+        cells = [link + f"<br><span class='muted'>{esc(industry)}</span>", esc(location),
+                 f"<span class='badge'>{esc(rank)} · {int(score)}/100</span>", esc(friendly(offer)), status_owner, contact, action]
+        desktop.append('<tr>' + ''.join('<td>' + value + '</td>' for value in cells) + '</tr>')
+        mobile.append(f"<article class='card lead-card'><h3>{link}</h3><p>{esc(industry)} · {esc(location)}</p><p>{esc(rank)} rank · {int(score)}/100 · {esc(friendly(offer))}</p><p>{status_owner}</p><p>{contact}</p>{action}</article>")
+    if not rows:
+        return "<section class='notice'><h3>No matching leads</h3><p>Clear a filter or <a href='/'>start a collection</a> to find businesses.</p></section>"
+    headers = ['Business','Location','Priority','Suggested offer','Sales / owner','Contact','Action']
+    head = ''.join('<th scope="col">'+esc(h)+'</th>' for h in headers)
+    return f"<div class='desktop-leads table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{''.join(desktop)}</tbody></table></div><div class='mobile-leads'>{''.join(mobile)}</div>"
+
+
+def lead_detail_page(company_id: int) -> str | None:
+    conn = connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('''SELECT c.*,li.organization_id,li.sales_rank,li.sales_readiness_score,
+            li.primary_offer,li.reachability_score,li.service_need_score,li.capacity_score,
+            li.demand_score,li.freshness_score,li.evidence_json,
+            sl.status,sl.assigned_pic,sl.notes,sl.call_outcome,sl.next_action_at,
+            sl.proposal_value,sl.updated_at AS sales_updated_at,sl.contact_count,
+            COALESCE(wi.public_email,'') AS public_email,
+            CASE WHEN cs.organization_id IS NULL THEN 0 ELSE 1 END AS suppressed
+            FROM companies c JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
+            JOIN sales_leads sl ON sl.organization_id=li.organization_id
+            LEFT JOIN website_intelligence wi ON wi.company_id=c.id
+            LEFT JOIN contact_suppression cs ON cs.organization_id=li.organization_id WHERE c.id=?''', (company_id,)).fetchone()
+        if row is None:
+            return None
+        history = [tuple(item) for item in conn.execute('''SELECT old_status,new_status,outcome,notes,created_by,created_at
+            FROM sales_activities WHERE organization_id=? ORDER BY id DESC LIMIT 50''', (row['organization_id'],))]
+    finally:
+        conn.close()
+    statuses = ['DO_NOT_CONTACT'] if row['suppressed'] else SALES_STATUSES
+    status_options = ''.join(f"<option value='{s}'{' selected' if s == row['status'] else ''}>{esc(friendly(s))}</option>" for s in statuses)
+    parts = [('Reachability',row['reachability_score']),('Service need',row['service_need_score']),
+             ('Capacity',row['capacity_score']),('Demand',row['demand_score']),('Freshness',row['freshness_score'])]
+    try:
+        evidence = json.loads(row['evidence_json'])
+    except (TypeError, ValueError):
+        evidence = {}
+    suppressed_notice = "<p class='notice bad'>Do not contact: this organization is suppressed. You can update notes but cannot reactivate it here.</p>" if row['suppressed'] else ''
+    body = f"""<p><a href='/leads'>← Review leads</a> · Organization #{int(row['organization_id'])} · sales updates apply to all locations of this organization.</p>
+      <section class='card'><h2 style='margin-top:0'>Business details</h2><p>{esc(row['sector'])} · {esc(row['address'])}</p>
+      <p>{contact_links(row['phone'],row['public_email'],row['website'])}</p><p><strong>{esc(row['sales_rank'])} rank · {row['sales_readiness_score']}/100</strong> · {esc(friendly(row['primary_offer']))}</p>
+      <details><summary>Why this rank and suggested offer?</summary><p>Automated prioritisation, not confirmed customer interest. A: 75+; B: 60–74; C: 45–59; D: below 45. Component points add up to the score.</p>{table(['Component','Points'],parts)}<pre style='white-space:pre-wrap;overflow-wrap:anywhere'>{esc(json.dumps(evidence,ensure_ascii=False,indent=2))}</pre></details></section>
+      {suppressed_notice}<section class='card' style='margin-top:18px'><h2 style='margin-top:0'>Assign and record sales outcomes</h2>
+      <p>Contact happens outside this dashboard. Saving records your team's update; it sends no messages.</p>
+      <form id='sales-form'><div class='grid2 form-grid'>
+        <label>Assigned salesperson<input name='assigned_pic' maxlength='120' value='{esc(row['assigned_pic'])}' placeholder='Name of the person responsible'></label>
+        <div><label for='sales-status'>Sales status</label><select id='sales-status' name='status'>{status_options}</select></div>
+        <label>Contact outcome<input name='call_outcome' maxlength='240' value='{esc(row['call_outcome'])}' placeholder='Connected, no answer, interested…'></label>
+        <label>Next follow-up (Malaysia time)<input name='next_action_at' type='datetime-local' value='{esc(myt_input(row['next_action_at']))}'></label>
+        <label>Proposal value (MYR)<input name='proposal_value' type='number' min='0' max='1000000000000' step='0.01' value='{esc(row['proposal_value'])}'></label>
+        <label>Contact notes<textarea name='notes' maxlength='2000'>{esc(row['notes'])}</textarea></label>
+      </div><p><label><input type='checkbox' name='record_contact' {'disabled' if row['suppressed'] else ''}>Record a contact made outside this dashboard</label></p>
+      <button class='button' type='submit'>Save sales update</button><p id='sales-result' role='status' aria-live='polite'></p>
+      <p class='small'>{int(row['contact_count'])} recorded contacts. <a href='/lead?id={company_id}'>Reload lead and activity history</a>.</p></form></section>
+      <section id='activity-history'><h2>Recent activity</h2>{table(['From','To','Outcome','Notes','Salesperson','Time'],history) if history else '<p class="notice">No sales activity yet. Assign a salesperson above, then record the first outcome.</p>'}</section>
+      <script>
+      let salesVersion = {json.dumps(row['sales_updated_at'])};
+      const form = document.getElementById('sales-form');
+      form.addEventListener('submit', async event => {{
+        event.preventDefault();const resultNode = document.getElementById('sales-result');
+        const button = form.querySelector('button');button.disabled = true;
+        const values = Object.fromEntries(new FormData(form));
+        values.organization_id = {int(row['organization_id'])};values.expected_updated_at = salesVersion;
+        values.record_contact = form.elements.record_contact.checked;
+        values.next_action_at = values.next_action_at ? values.next_action_at + ':00+08:00' : '';
+        try {{
+          const response = await fetch('/api/sales/update',{{method:'POST',headers:{{'Content-Type':'application/json','X-Collector-Token':{json.dumps(COLLECTOR_TOKEN)}}},body:JSON.stringify(values)}});
+          const result = await response.json();if (!response.ok) throw new Error(result.error || 'Save failed');
+          salesVersion = result.updated_at;form.elements.record_contact.checked = false;
+          resultNode.textContent = 'Saved. Reload to see the updated activity history.';
+          if (values.status === 'DO_NOT_CONTACT') {{form.elements.record_contact.disabled = true;Array.from(form.elements.status.options).forEach(option => option.disabled = option.value !== 'DO_NOT_CONTACT');}}
+        }} catch (error) {{resultNode.textContent = error.message;}} finally {{button.disabled = false;}}
+      }});
+      </script>"""
+    return page(row['business_name'], body, 'leads')
+
+
+def myt_input(value) -> str:
+    if not value:
+        return ''
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%dT%H:%M')
+    except ValueError:
+        return ''
 
 
 CALL_LIST_COLUMNS = [
@@ -664,7 +1048,7 @@ def pipeline_page(message: str = "") -> str:
            WHEN 'PROPOSAL_SENT' THEN 5 WHEN 'WON' THEN 6 WHEN 'LOST' THEN 7 ELSE 8 END"""
     ).fetchall()
     by_pic = conn.execute(
-        """SELECT COALESCE(assigned_pic,'Unassigned'),COUNT(*),
+        """SELECT COALESCE(NULLIF(assigned_pic,''),'Unassigned'),COUNT(*),
                   SUM(CASE WHEN status IN ('QUALIFIED','DISCOVERY','PROPOSAL_SENT','WON') THEN 1 ELSE 0 END),
                   SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END),SUM(COALESCE(proposal_value,0))
            FROM sales_leads GROUP BY assigned_pic ORDER BY COUNT(*) DESC"""
@@ -705,42 +1089,57 @@ def pipeline_page(message: str = "") -> str:
            FROM sales_activities sa LEFT JOIN organizations o ON o.id=sa.organization_id
            ORDER BY sa.id DESC LIMIT 100"""
     ).fetchall()
+    actionable = conn.execute('''SELECT li.organization_id,c.business_name,COALESCE(ic.industry_label,c.sector),
+        li.primary_offer,li.sales_readiness_score,li.sales_rank,sl.status,COALESCE(sl.assigned_pic,''),
+        c.phone,COALESCE(wi.public_email,''),c.website,c.locality,c.state_name,c.rating,c.reviews_count,c.id
+        FROM sales_leads sl JOIN companies c ON c.id=sl.representative_company_id
+        JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
+        LEFT JOIN company_industry_classification ic ON ic.company_id=c.id AND ic.taxonomy_version=4
+        LEFT JOIN website_intelligence wi ON wi.company_id=c.id
+        WHERE sl.status NOT IN ('WON','LOST','DO_NOT_CONTACT')
+        ORDER BY CASE WHEN COALESCE(sl.assigned_pic,'')='' THEN 0 ELSE 1 END,
+                 li.sales_readiness_score DESC LIMIT 50''').fetchall()
     conn.close()
     notice = f"<p class='good'>{esc(message)}</p>" if message else ""
     sample = ",".join(CALL_LIST_COLUMNS) + "\n1,1,Example Business,Construction,SEO_UPGRADE,80,A,CONTACTED,PIC Name,0123456789,,,,,,,,,,,Connected,SEO proposal,RM5k-RM10k,,,Follow up next week"
-    body = f"""{notice}<div class='actions'><a class='button' href='/export/call-list.csv'>Download A/B call-list CSV</a></div>
-      <p>Update the downloaded CSV using valid statuses: {esc(', '.join(SALES_STATUSES))}. Re-importing records an append-only activity. Email and WhatsApp outreach are not enabled.</p>
+    body = f"""{notice}<section class='notice'><strong>Next step: assign leads and record outcomes.</strong><p>Open Review below to assign a salesperson, change status, or log contact notes. Contact businesses outside this dashboard; email and WhatsApp sending are not enabled.</p></section>
+      <div class='grid2'><div><h2>Sales funnel</h2>{table(['Status','Organizations','Proposal value (MYR)'],[(friendly(s),n,v) for s,n,v in funnel])}</div>
+      <div><h2>By salesperson</h2>{table(['Salesperson','Leads','Qualified+','Won','Proposal value (MYR)'],by_pic)}</div></div>
+      <section id='pipeline-leads'><h2>Assign and follow up</h2><p>First 50 open organizations, with unassigned leads first. <a href='/leads'>Search and filter all leads →</a></p>{compact_leads(actionable)}</section>
+      <details><summary>CSV handoff · download or import team updates</summary><div class='actions'><a class='button' href='/export/call-list.csv'>Download all eligible A/B organizations</a></div>
+      <p>CSV import/export remains available for offline team handoff. Valid statuses: {esc(', '.join(SALES_STATUSES))}. Re-importing records an append-only activity.</p>
       <form id='import-form'><input id='csv-file' type='file' accept='.csv,text/csv' required>
-      <button class='button' type='submit'>Import PIC updates</button></form><pre style='display:none'>{esc(sample)}</pre>
-      <div class='grid2'><div><h2>Funnel</h2>{table(['Status','Organizations','Proposal value'],funnel)}</div>
-      <div><h2>By PIC</h2>{table(['PIC','Leads','Qualified+','Won','Proposal value'],by_pic)}</div></div>
+      <button class='button' type='submit'>Import team updates</button></form><pre style='display:none'>{esc(sample)}</pre></details>
+      <details id='conversion-analytics'><summary>Conversion analytics · industry, offer, market and search term</summary>
+      <p>Rates reflect recorded sales updates, not automatically tracked conversations. Zero means no conversion has been recorded. Proposal and revenue amounts are in MYR.</p>
       <h2>Conversion by industry</h2>{table(['Industry','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100 leads'],conversion_by_industry)}
       <div class='grid2'><div><h2>Conversion by primary offer</h2>{table(['Offer','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100'],conversion_by_offer)}</div>
       <div><h2>Conversion by market</h2>{table(['Market','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100'],conversion_by_market)}</div></div>
       <h2>Conversion by source query term</h2>{table(['Term','Leads','Contact %','Qualification %','Proposal %','Close %','Won revenue / 100'],by_query_term)}
-      <h2>Recent sales activity</h2>{table(['Org ID','Organization','From','To','Outcome','Notes','PIC','Time'],recent)}
+      </details><h2>Recent sales activity</h2>{table(['Org ID','Organization','From','To','Outcome','Notes','Salesperson','Time'],recent) if recent else '<p class="notice">No sales activity yet. Open a lead above, assign a salesperson, and record the first outcome.</p>'}
       <script>document.getElementById('import-form').addEventListener('submit',async event=>{{event.preventDefault();const file=document.getElementById('csv-file').files[0];
       const response=await fetch('/import/sales-updates',{{method:'POST',headers:{{'Content-Type':'text/csv; charset=utf-8'}},body:await file.text()}});
       document.open();document.write(await response.text());document.close();}});</script>"""
-    return page("Sales pipeline and PIC handoff", body, "pipeline")
+    return page("Assign and track sales", body, "pipeline")
 
 
-def coverage_page() -> str:
+def coverage_page(started_only: bool = False) -> str:
     conn = connection()
+    having = " HAVING SUM(CASE WHEN status IN ('running','completed','failed') THEN 1 ELSE 0 END)>0" if started_only else ''
     market = conn.execute(
         """SELECT CASE WHEN state IN ('Selangor','Federal Territory') THEN 'Klang Valley'
                          WHEN state IN ('Perak','Pahang','Kedah','Negeri Sembilan','Melaka')
                            THEN 'Peninsular Expansion' ELSE state END,
                   COUNT(*),SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
                   SUM(qualified_new),SUM(ab_leads_new),ROUND(AVG(expected_ab_yield),2)
-           FROM search_jobs WHERE taxonomy_version=4 GROUP BY 1 ORDER BY COUNT(*) DESC"""
+           FROM search_jobs WHERE taxonomy_version=4 GROUP BY 1""" + having + " ORDER BY COUNT(*) DESC"
     ).fetchall()
     yield_rows = conn.execute(
         """SELECT sector,strategy_bucket,COUNT(*),SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
                   SUM(qualified_new),SUM(ab_leads_new),ROUND(AVG(expected_ab_yield),2),
                   ROUND(100.0*SUM(duplicate_count)/NULLIF(SUM(processed_count),0),1)
-           FROM search_jobs WHERE taxonomy_version=4 GROUP BY sector,strategy_bucket
-           ORDER BY SUM(ab_leads_new) DESC,AVG(expected_ab_yield) DESC LIMIT 100"""
+           FROM search_jobs WHERE taxonomy_version=4 GROUP BY sector,strategy_bucket""" + having +
+           " ORDER BY SUM(ab_leads_new) DESC,AVG(expected_ab_yield) DESC LIMIT 100"
     ).fetchall()
     coverage = conn.execute(
         """SELECT c.state_name,COALESCE(ic.industry_label,c.sector),COUNT(*),
@@ -748,15 +1147,15 @@ def coverage_page() -> str:
            FROM companies c LEFT JOIN company_industry_classification ic
              ON ic.company_id=c.id AND ic.taxonomy_version=4
            LEFT JOIN lead_intelligence li ON li.company_id=c.id AND li.intelligence_version=4
-           WHERE c.state_name IN ('Selangor','Federal Territory','Johor','Penang',
-                                  'Perak','Pahang','Kedah','Negeri Sembilan','Melaka')
            GROUP BY c.state_name,2 ORDER BY c.state_name,COUNT(*) DESC"""
     ).fetchall()
     conn.close()
-    body = f"""<p>New V4 query allocation while pilot work is available: about 48% Klang Valley, 22% Johor, 17% Penang, and 13% GDP-ranked Peninsular expansion. Older nationwide records remain available.</p>
-      <h2>Query allocation and results</h2>{table(['Market','Queries','Completed','Qualified','A/B leads','Expected A/B'],market)}
-      <h2>A/B yield by industry and strategy</h2>{table(['Industry','Strategy','Queries','Completed','Qualified','A/B leads','Expected A/B','Duplicate %'],yield_rows)}
-      <h2>Lead coverage in core and pilot markets</h2>{table(['State','Industry','Locations','A/B leads'],coverage)}"""
+    body = f"""<p class='help'>Use this advanced view to understand where searches are planned and which searches produce sales-ready leads. A planned search is not collected coverage.</p>
+      <form method='get'><label><input type='checkbox' name='started' value='1' {'checked' if started_only else ''}>Hide groups with no started searches</label><button class='button'>Apply</button></form>
+      <details><summary>Definitions and default search allocation</summary><p>Completed = finished searches. Collected = new locations that passed collection checks. A/B leads = new higher-priority ranked locations, not confirmed prospects. Estimated A/B per search = average predicted yield, not a total or a guarantee. Duplicate rate = duplicate observations divided by processed listings.</p><p>The broad default plan rotates approximately 48% Klang Valley, 22% Johor, 17% Penang and 13% Peninsular pilot searches while pilot work remains. Selected campaigns use your chosen areas instead.</p></details>
+      <h2>Search plan versus collected results</h2>{table(['Market','Planned searches','Completed','Collected locations','New A/B locations','Estimated A/B per search'],market)}
+      <details><summary>Industry and strategy yield</summary>{table(['Industry','Strategy','Planned searches','Completed','Collected locations','New A/B locations','Estimated A/B per search','Duplicate %'],[(sector,friendly(strategy),*values) for sector,strategy,*values in yield_rows])}</details>
+      <h2>Collected lead coverage — all states</h2>{table(['State','Industry','Locations','A/B-ranked locations'],coverage)}"""
     return page("Coverage and query yield", body, "coverage")
 
 
@@ -797,6 +1196,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if not DB_PATH.exists() and parsed.path in ('/leads','/pipeline','/coverage','/searches','/lead'):
+                if parsed.path == '/lead':
+                    self.send_error(404, 'Lead not found')
+                else:
+                    active = {'/leads':'leads','/pipeline':'pipeline','/coverage':'coverage','/searches':'searches'}[parsed.path]
+                    self.respond(page('No leads yet', "<section class='card'><h2>Start your first collection</h2><p>Choose industries and locations, preview the searches, then start collection. Your leads will appear here when collected.</p><a class='button' href='/'>Set up collection</a></section>",active), 'text/html; charset=utf-8')
+                return
             if parsed.path in ("/", "/index.html"):
                 self.respond(dashboard_page(dashboard_data()), "text/html; charset=utf-8")
             elif parsed.path == "/searches":
@@ -808,12 +1214,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(searches_page(query, page_number), "text/html; charset=utf-8")
             elif parsed.path == "/leads":
                 self.respond(ranked_leads_page(parse_qs(parsed.query)), "text/html; charset=utf-8")
+            elif parsed.path == '/lead':
+                try:
+                    company_id = int(parse_qs(parsed.query).get('id', ['0'])[0])
+                except ValueError:
+                    self.send_error(400, 'Invalid lead ID')
+                    return
+                detail = lead_detail_page(company_id)
+                if detail is None:
+                    self.send_error(404, 'Lead not found')
+                    return
+                self.respond(detail, 'text/html; charset=utf-8')
             elif parsed.path == "/pipeline":
                 self.respond(pipeline_page(), "text/html; charset=utf-8")
             elif parsed.path == "/coverage":
-                self.respond(coverage_page(), "text/html; charset=utf-8")
+                self.respond(coverage_page(parse_qs(parsed.query).get('started') == ['1']), "text/html; charset=utf-8")
             elif parsed.path == "/api/status":
                 self.respond(json.dumps(load_status()), "application/json; charset=utf-8")
+            elif parsed.path == '/api/collector':
+                self.respond(json.dumps(collector_controller().snapshot()), 'application/json; charset=utf-8')
             elif parsed.path == "/export/companies.csv":
                 stream_company_csv(self)
             elif parsed.path == "/export/call-list.csv":
@@ -837,6 +1256,52 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in ('/api/collector/start', '/api/collector/pause', '/api/collector/preview', '/api/sales/update'):
+            host = self.headers.get('Host', '')
+            origin = self.headers.get('Origin')
+            hostname = urlparse('http://' + host).hostname
+            token = self.headers.get('X-Collector-Token', '')
+            if (hostname not in ('127.0.0.1', 'localhost', '::1')
+                    or (origin and urlparse(origin).netloc != host)
+                    or not secrets.compare_digest(token, COLLECTOR_TOKEN)):
+                self.send_error(403, 'Collector controls require a local dashboard request')
+                return
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if not 0 < size <= 65536 or self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
+                    raise ValueError('Expected a JSON request of at most 64 KiB')
+                payload = json.loads(self.rfile.read(size))
+                if not isinstance(payload, dict):
+                    raise ValueError('Expected a JSON object')
+                control = collector_controller()
+                if parsed.path == '/api/sales/update':
+                    if not DB_PATH.exists():
+                        raise ValueError('No leads yet. Start a collection before editing sales records.')
+                    conn = write_connection()
+                    try:
+                        result = save_sales_update(conn, payload)
+                    finally:
+                        conn.close()
+                    global _dashboard_cache_at
+                    _dashboard_cache_at = 0.0
+                elif parsed.path.endswith('/pause'):
+                    result = control.pause()
+                elif parsed.path.endswith('/preview'):
+                    result = preview_selection(payload.get('selection'), DB_PATH)
+                else:
+                    result = control.start(payload.get('target', 400_000), payload.get('workers', 5),
+                                           selection=payload.get('selection'))
+                self.respond(json.dumps(result), 'application/json; charset=utf-8')
+            except StaleSalesEdit as exc:
+                self.send_response(409)
+                self.respond_json_error(str(exc))
+            except (ValueError, TypeError) as exc:
+                self.send_response(400)
+                self.respond_json_error(str(exc))
+            except (OSError, sqlite3.Error) as exc:
+                self.send_response(500)
+                self.respond_json_error(str(exc))
+            return
         if parsed.path != "/import/sales-updates":
             self.send_error(404)
             return
@@ -857,6 +1322,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def respond_json_error(self, message: str) -> None:
+        content = json.dumps({'error': message}).encode('utf-8')
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(content)))
         self.end_headers()
         self.wfile.write(content)
 
@@ -889,5 +1361,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--database', type=Path, default=DB_PATH)
+    parser.add_argument('--status-file', type=Path)
+    args = parser.parse_args()
+    DB_PATH = args.database.resolve()
+    if args.status_file:
+        STATUS_PATH = args.status_file.resolve()
+    elif args.database != ROOT / 'data' / 'malaysia_qualified_companies.sqlite':
+        STATUS_PATH = DB_PATH.with_suffix(DB_PATH.suffix + '.status.json')
     print(f"Dashboard: http://localhost:{PORT}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

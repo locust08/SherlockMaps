@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import ctypes
 import hashlib
 import json
 import logging
@@ -19,6 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from collector_control import CollectorBusy, CollectorLock, pause_path, write_state, write_json
+from system_memory import available_memory
 
 from lead_intelligence_v4 import (
     HIGH_VALUE_INDUSTRIES,
@@ -754,7 +756,12 @@ def weighted_market_order(tasks: list[QueryTask]) -> list[QueryTask]:
     return ordered
 
 
-def build_manifest(conn: sqlite3.Connection | None = None) -> list[QueryTask]:
+def build_manifest(conn: sqlite3.Connection | None = None, selection: dict | None = None) -> list[QueryTask]:
+    if selection is not None:
+        from collection_selection import normalize_selection, selected_manifest
+        selection = normalize_selection(selection)
+        if selection['mode'] == 'selected':
+            return selected_manifest(selection, conn)
     tasks: list[QueryTask] = []
     estimate_cache = yield_estimate_cache(conn)
     estimate = lambda sector, term: estimate_cache.get((sector, term), 4.0)
@@ -848,6 +855,9 @@ def build_manifest(conn: sqlite3.Connection | None = None) -> list[QueryTask]:
 
 
 def expand_task(task: QueryTask) -> list[QueryTask]:
+    # Explicit campaigns never expand beyond the locations selected by the user.
+    if task.strategy_bucket in ('selected', 'custom'):
+        return []
     if task.geo_level != "city":
         return []
     children = [QueryTask(
@@ -888,7 +898,11 @@ def register_manifest(conn: sqlite3.Connection, manifest: list[QueryTask]) -> No
 
 def is_relevant(task: QueryTask, name: str, category: str) -> bool:
     haystack = normalized(f"{name} {category}")
-    return any(keyword in haystack for keyword in SECTOR_KEYWORDS[task.sector])
+    relevant = any(keyword in haystack for keyword in SECTOR_KEYWORDS[task.sector])
+    if not relevant and task.strategy_bucket == 'custom':
+        from collection_selection import custom_keyword_matches
+        return custom_keyword_matches(task.term, name, category)
+    return relevant
 
 
 def find_existing_company(conn: sqlite3.Connection, place_id: str, phone: str, name: str, address: str, domain: str) -> sqlite3.Row | None:
@@ -896,6 +910,17 @@ def find_existing_company(conn: sqlite3.Connection, place_id: str, phone: str, n
         row = conn.execute("SELECT id FROM companies WHERE maps_place_id=?", (place_id,)).fetchone()
         if row:
             return row
+        if phone:
+            # An earlier crawl may have missed the Maps identifier. Upgrade a
+            # single provisional phone match instead of creating a second lead.
+            # Never match a different known Place ID through a shared phone.
+            provisional = conn.execute(
+                "SELECT id FROM companies WHERE normalized_phone=? "
+                "AND (maps_place_id IS NULL OR maps_place_id='') LIMIT 2",
+                (phone,),
+            ).fetchall()
+            if len(provisional) == 1:
+                return provisional[0]
     # A distinct stable Place ID represents a distinct physical branch even when
     # a chain shares one central phone/domain. Fall back to phone only when Maps
     # did not expose a stable location identifier.
@@ -1082,18 +1107,8 @@ def crawl_task(task: QueryTask, db_path: str) -> CrawlOutcome:
 
 
 def available_memory_gb() -> float:
-    if os.name == "nt":
-        class MemoryStatus(ctypes.Structure):
-            _fields_ = [("length", ctypes.c_ulong), ("memory_load", ctypes.c_ulong),
-                        ("total_phys", ctypes.c_ulonglong), ("avail_phys", ctypes.c_ulonglong),
-                        ("total_page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong),
-                        ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong),
-                        ("avail_extended_virtual", ctypes.c_ulonglong)]
-        status = MemoryStatus()
-        status.length = ctypes.sizeof(MemoryStatus)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-        return round(status.avail_phys / (1024 ** 3), 2)
-    return 99.0
+    # Unknown measurements conservatively block new browser submissions.
+    return available_memory()['available_ram_gb'] or 0.0
 
 
 def desired_worker_count(
@@ -1261,11 +1276,10 @@ def write_status(
         "target_qualified_companies": target, "qualified_companies": count,
         "active_workers": workers, "actual_browser_processes": workers,
         "scheduler_worker_limit": worker_limit if worker_limit is not None else workers,
-        "preferred_workers": DEFAULT_WORKERS,
-        "maximum_workers": MAXIMUM_WORKERS,
-        "available_ram_gb": ram, "reserved_ram_gb": RAM_RESERVE_GB,
+        "preferred_workers": int(diagnostics.get('preferred_workers', DEFAULT_WORKERS)),
+        "maximum_workers": int(diagnostics.get('maximum_workers', MAXIMUM_WORKERS)),
+        **available_memory(), "reserved_ram_gb": RAM_RESERVE_GB,
         "ram_policy_mode": RAM_POLICY_MODE,
-        "ram_operating_state": ram_operating_state(ram),
         "memory_pressure_pauses": int(diagnostics.get("memory_pressure_pauses", 0)),
         "storage_lock_errors": int(diagnostics.get("storage_lock_errors", 0)),
         "storage_lock_recovery_until": diagnostics.get("storage_lock_recovery_until"),
@@ -1338,9 +1352,49 @@ def count_ab_leads_for_prompt(conn: sqlite3.Connection, task: QueryTask) -> int:
 
 
 def run_batch(args: argparse.Namespace) -> int:
+    """Both dashboard and CLI launches share one lifetime lock per database."""
+    global DB_PATH, DATA_DIR, STATUS_PATH, LOG_PATH
+    previous = DB_PATH, DATA_DIR, STATUS_PATH, LOG_PATH
+    DB_PATH = Path(args.database or DB_PATH).resolve()
+    if args.database:
+        DATA_DIR = DB_PATH.parent
+        LOG_PATH = DB_PATH.with_suffix(DB_PATH.suffix + '.collector.log')
+        STATUS_PATH = DB_PATH.with_suffix(DB_PATH.suffix + '.status.json')
+    if args.status_file:
+        STATUS_PATH = Path(args.status_file).resolve()
+    try:
+        with CollectorLock(DB_PATH):
+            if pause_path(DB_PATH).exists():
+                write_state(DB_PATH, 'paused')
+                return 0
+            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            write_state(DB_PATH, 'running', pid=os.getpid(), target=args.target, workers=args.workers)
+            try:
+                result = _run_batch(args)
+            except Exception as exc:
+                write_state(DB_PATH, 'failed', error=f'{type(exc).__name__}: {exc}')
+                raise
+            state = 'paused' if pause_path(DB_PATH).exists() else ('completed' if result == 0 else 'failed')
+            error = None
+            if state == 'failed' and STATUS_PATH.exists():
+                error = json.loads(STATUS_PATH.read_text(encoding='utf-8')).get('halt_reason')
+            write_state(DB_PATH, state, exit_code=result, error=error, target=args.target, workers=args.workers)
+            return result
+    except CollectorBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+    finally:
+        DB_PATH, DATA_DIR, STATUS_PATH, LOG_PATH = previous
+
+
+def _run_batch(args: argparse.Namespace) -> int:
+    from collection_selection import load_selection, selection_path
+    selection = load_selection(DB_PATH, args.selection_file)
+    # CLI-supplied campaigns must also survive a watchdog/dashboard resume.
+    write_json(selection_path(DB_PATH), selection)
     setup_logging()
     started_at = time.time()
-    conn = open_db()
+    conn = open_db(DB_PATH)
     backfilled = backfill_v4(conn)
     logging.info("V4 intelligence backfill refreshed %s existing leads", backfilled)
     # A previous process may have been interrupted after marking jobs running.
@@ -1350,16 +1404,19 @@ def run_batch(args: argparse.Namespace) -> int:
            WHERE taxonomy_version IN (3,4) AND status='running'""",
     )
     conn.commit()
-    manifest = build_manifest(conn)
+    manifest = build_manifest(conn, selection=selection)
     register_manifest(conn, manifest)
     logging.info("V4 manifest contains %s queries; target=%s", len(manifest), args.target)
     if args.dry_run:
         print(json.dumps({"queries": len(manifest), "initial_capacity": len(manifest) * args.initial_results,
                           "hard_capacity": len(manifest) * args.hard_result_cap, "target": args.target}))
+        conn.close()
         return 0
     count = qualified_count(conn)
     if count >= args.target:
-        write_status(conn, args.target, 0, started_at, worker_limit=0)
+        write_status(conn, args.target, 0, started_at, worker_limit=0,
+                     diagnostics={'preferred_workers': args.workers, 'maximum_workers': args.max_workers})
+        conn.close()
         return 0
     task_by_prompt = {task.prompt: replace(task, initial_results=args.initial_results,
                                            adaptive_results=args.adaptive_results,
@@ -1382,6 +1439,8 @@ def run_batch(args: argparse.Namespace) -> int:
     session_completed = 0
     initial_ram = available_memory_gb()
     diagnostics: dict[str, Any] = {
+        'preferred_workers': args.workers,
+        'maximum_workers': args.max_workers,
         "memory_pressure_pauses": 0,
         "storage_lock_errors": 0,
         "reclaimed_jobs": 0,
@@ -1400,6 +1459,10 @@ def run_batch(args: argparse.Namespace) -> int:
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
         while count < args.target and (pending or active):
+            pausing = pause_path(DB_PATH).exists()
+            if pausing and not active:
+                halt_reason = 'Paused by dashboard; saved progress will resume on Start / Resume.'
+                break
             now = time.time()
             ram = available_memory_gb()
             if ram < float(diagnostics["lowest_available_ram_gb"]):
@@ -1446,6 +1509,7 @@ def run_batch(args: argparse.Namespace) -> int:
                 upscale_candidate_since = None
 
             while (pending and len(active) < effective_limit and count < args.target
+                   and not pause_path(DB_PATH).exists()
                    and submission_allowed(ram, time.time(), cooldown_until)):
                 task = pending.popleft()
                 row = conn.execute(
@@ -1616,11 +1680,14 @@ def run_batch(args: argparse.Namespace) -> int:
                  worker_limit=0, diagnostics=diagnostics)
     record_event(conn, "collector_stopped", halt_reason or "target reached", 0)
     conn.close()
-    return 0 if count >= args.target else 2
+    return 0 if count >= args.target or pause_path(DB_PATH).exists() else 2
 
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument('--database', type=Path, help='SQLite database (defaults to the project lead database)')
+    parser.add_argument('--status-file', type=Path, help='Dashboard status JSON path')
+    parser.add_argument('--selection-file', type=Path, help='Saved industry/location selection JSON (defaults to database sidecar)')
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--target", type=int, default=TARGET)
     parser.add_argument("--initial-results", type=int, default=INITIAL_RESULTS)

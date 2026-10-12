@@ -75,6 +75,7 @@ from core.crawl_runner import run_crawl_in_process
 from core.extractors.email_extractor import EmailCrawlerConfig, EmailExtractor, extract_emails_from_websites
 from core.models import CrawlerConfig
 from core.processors import URLValidator
+from core.async_deadline import bounded_await, positive_seconds
 
 # Configure logging
 logging.basicConfig(
@@ -94,6 +95,9 @@ app_instance: Optional[FastAPI] = None
 _background_tasks: set[asyncio.Task] = set()
 _crawl_dispatch_lock = asyncio.Lock()
 _email_dispatch_lock = asyncio.Lock()
+EMAIL_JOB_TIMEOUT_SECONDS = positive_seconds(os.getenv("EMAIL_JOB_TIMEOUT_SECONDS", "600"))
+EMAIL_WEBSITE_TIMEOUT_SECONDS = positive_seconds(os.getenv("EMAIL_WEBSITE_TIMEOUT_SECONDS", "300"))
+EMAIL_CLEANUP_TIMEOUT_SECONDS = positive_seconds(os.getenv("EMAIL_CLEANUP_TIMEOUT_SECONDS", "10"))
 
 
 def spawn_background_task(coro) -> asyncio.Task:
@@ -1084,13 +1088,19 @@ async def _process_next_email_job(job_id: str) -> None:
             page_timeout=15000,
             crawl_delay=1.5,
             max_pages_per_domain=20,
+            timeout_per_website=EMAIL_WEBSITE_TIMEOUT_SECONDS,
+            cleanup_timeout=EMAIL_CLEANUP_TIMEOUT_SECONDS,
         )
 
         # Run the email crawl
-        emails = await extract_emails_from_websites(
-            websites=email_job.websites,
-            job_id=email_job.parent_job_id,
-            config=email_config,
+        emails = await bounded_await(
+            extract_emails_from_websites(
+                websites=email_job.websites,
+                job_id=email_job.parent_job_id,
+                config=email_config,
+            ),
+            EMAIL_JOB_TIMEOUT_SECONDS,
+            cancellation_grace=EMAIL_CLEANUP_TIMEOUT_SECONDS,
         )
 
         if email_job.status == JobStatus.CANCELLED:

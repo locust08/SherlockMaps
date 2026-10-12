@@ -7,6 +7,7 @@ $pythonExe = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $collector = 'batch_collect_malaysia.py'
 $dataDir = Join-Path $projectRoot 'data'
 $watchdogLog = Join-Path $dataDir 'malaysia_watchdog.log'
+$pauseFile = Join-Path $dataDir 'malaysia_qualified_companies.sqlite.pause'
 $stdoutLog = Join-Path $dataDir 'malaysia_batch_autostart_stdout.log'
 $stderrLog = Join-Path $dataDir 'malaysia_batch_autostart_stderr.log'
 $dashboardStdout = Join-Path $dataDir 'malaysia_dashboard_stdout.log'
@@ -21,6 +22,8 @@ $running = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 if ($running) {
     "$(Get-Date -Format o) collector already running: $($running.ProcessId -join ',')" |
         Add-Content -Path $watchdogLog
+} elseif (Test-Path $pauseFile) {
+    "$(Get-Date -Format o) collector paused by dashboard; not restarting" | Add-Content -Path $watchdogLog
 } else {
     "$(Get-Date -Format o) starting collector" | Add-Content -Path $watchdogLog
     Start-Process -FilePath $pythonExe -ArgumentList '-u', $collector `
